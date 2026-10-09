@@ -1062,7 +1062,7 @@ export default {
         noLedger: '尚无记录。每轮对话结束后会自动累加。',
         noPrice: '无',
         noPriceLong: '供应商目录与内置 models.dev 价格表中都没有该模型。可运行 scripts/gen-rates.py 刷新价格表。',
-        ofWould: '/ 原价',
+        ofWould: '原价',
         output: '输出',
         pageTitle: '令牌与花费账本',
         paneTitle: '令牌与花费',

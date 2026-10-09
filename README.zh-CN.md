@@ -6,7 +6,7 @@
 以及提示词缓存帮你省了多少钱。所有观察到的用量都会折叠进本地的按日账本，
 **重启 Hermes 之后数字依然在**。
 
-<img src="image/statusbar-chip.png" alt="状态栏芯片：输入 376.4k、输出 100.8k、$11.08、缓存命中 97%、今日 $11.80" width="520">
+<img src="image/statusbar-chip-zh.png" alt="状态栏芯片：输入 505.4k、输出 104.6k、$12.45、缓存命中 97%、今日 $13.16" width="520">
 
 点击芯片进入完整账本：今日 / 近 7 天 / 本月 / 全部，按模型拆分，每行带缓存命中率和节省额。
 
@@ -52,7 +52,7 @@ cp desktop/plugin.js ~/.hermes/desktop-plugins/token-cost-meter/
 **右侧面板** —— 本次会话的 token 明细、当前适用的单价、提示词缓存区块
 （命中率、缓存 vs 新增、节省金额），以及今日 / 近 7 天 / 本月的小计。
 
-<img src="image/session-pane.png" alt="会话面板：claude-opus-5 运行于 github-copilot，花费 $11.08，合计 13.83M token，缓存命中率 97%，已节省 $60.08" width="340">
+<img src="image/session-pane-zh.png" alt="会话面板：claude-opus-5 运行于 github-copilot，花费 $12.45，合计 15.22M 令牌，缓存命中率 97%，已节省 $65.73，单价 $5/$25/$0.5 每百万令牌" width="340">
 
 **账本整页** —— 四个时间区间的按模型表格，带总计、整体缓存命中率和累计节省额。
 
