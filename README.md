@@ -7,9 +7,7 @@ focused session has burned, what that costs in USD, and how much the prompt
 cache is saving you. Everything it observes is folded into a local per-day
 ledger, so the numbers are still there after you restart Hermes.
 
-```
-120.0k↑  8.0k↓ · $1.49 · ⚡95% · today $5.12
-```
+<img src="image/statusbar-chip.png" alt="Status bar chip: 376.4k input, 100.8k output, $11.08, 97% cache hit, $11.80 today" width="520">
 
 Click the chip for the full ledger: today / 7 days / this month / all time,
 broken down per model, with cache hit rate and savings per row.
@@ -59,6 +57,8 @@ today's running total. Hover for details.
 **Right-hand pane** — this session's token breakdown, the rates being applied,
 a prompt-cache section (hit rate, cached vs fresh, dollars saved), and
 subtotals for today / 7 days / this month.
+
+<img src="image/session-pane.png" alt="Session pane showing claude-opus-5 on github-copilot: $11.08, 13.83M total tokens, 97% cache hit rate, $60.08 saved" width="340">
 
 **Ledger page** — a sortable per-model table across four time ranges, with a
 grand total, aggregate cache hit rate and total savings.
