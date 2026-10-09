@@ -1,5 +1,7 @@
 # Token & Cost Meter
 
+**English** · [简体中文](README.zh-CN.md)
+
 A Hermes Desktop plugin that shows, live in the status bar, how many tokens the
 focused session has burned, what that costs in USD, and how much the prompt
 cache is saving you. Everything it observes is folded into a local per-day
