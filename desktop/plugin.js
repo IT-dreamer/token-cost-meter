@@ -482,7 +482,15 @@ function useRateLookup() {
 
 /** The focused session's live numbers. */
 function useLive() {
-  const usage = useValue(host.state.focusedUsage)
+  const rawUsage = useValue(host.state.focusedUsage)
+  // After a restart the host seeds the focused session with an all-zero usage
+  // object (the gateway's counters live in process memory). Treat that as
+  // "nothing yet" so the UI falls back to the persisted ledger instead of
+  // advertising a live $0.00.
+  const usage =
+    rawUsage && (num(rawUsage.input) || num(rawUsage.output) || num(rawUsage.total) || num(rawUsage.calls))
+      ? rawUsage
+      : null
   const stateModel = useValue(host.state.model)
   const { error, loading, lookup, providerHint } = useRateLookup()
 
