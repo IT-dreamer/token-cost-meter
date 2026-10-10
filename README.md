@@ -30,10 +30,18 @@ history.
 
 ## Install
 
-### From the plugin catalog
+### From this repository
 
 ```bash
-hermes plugins install token-cost-meter
+hermes plugins install IT-dreamer/token-cost-meter
+```
+
+Hermes will note that this is a custom, unreviewed source — it is not (yet) in
+the official plugin catalog. To pin an exact commit rather than tracking the
+default branch:
+
+```bash
+hermes plugins install IT-dreamer/token-cost-meter --ref <40-char-commit-sha>
 ```
 
 ### Manually

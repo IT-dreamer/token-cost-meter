@@ -26,10 +26,17 @@ Hermes 网关本身会上报实时 token 计数，但费用这一侧有两个缺
 
 ## 安装
 
-### 从插件目录安装
+### 从本仓库安装
 
 ```bash
-hermes plugins install token-cost-meter
+hermes plugins install IT-dreamer/token-cost-meter
+```
+
+Hermes 会提示这是未经审核的自定义来源——它目前还没有进入官方插件目录。
+如果想钉死某个提交而不是跟随默认分支：
+
+```bash
+hermes plugins install IT-dreamer/token-cost-meter --ref <40位提交SHA>
 ```
 
 ### 手动安装
