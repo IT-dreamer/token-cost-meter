@@ -970,18 +970,11 @@ function rangeNotes(t, totals, storageError) {
   return notes
 }
 
-function rowLabel(r) {
-  return r.provider ? `${r.model} · ${r.provider}` : r.model
-}
-
-/** Right-hand pane: live session on top, persisted totals below. */
+/** Right-hand pane: the focused session only. Range totals live on the ledger page. */
 function Meter() {
   const t = usePluginI18n(ID)
   const live = useLive()
   const storageError = useValue($storageError)
-  const today = useSummary('today')
-  const week = useSummary('week')
-  const month = useSummary('month')
   const sections = []
 
   if (live.usage) {
@@ -1068,18 +1061,7 @@ function Meter() {
     sections.push(jsx(Note, { children: t('empty') }, 'live'))
   }
 
-  for (const [range, s] of [['today', today], ['week', week], ['month', month]]) {
-    if (!s.rows.length) continue
-    const rows = s.rows.map((r, i) =>
-      jsx(Row, {
-        label: rowLabel(r),
-        value: `${fmtTokens(tokensOf(r))} · ${r.cost == null ? '—' : fmtUsd(r.cost)}`
-      }, `${i}`)
-    )
-    rows.push(jsx(Row, { label: t('subtotal'), value: s.totals.known ? fmtUsd(s.totals.cost) : '—' }, '__sum'))
-    sections.push(jsx(Section, { title: t(`range_${range}`), children: rows }, range))
-  }
-  sections.push(...rangeNotes(t, month.totals, storageError))
+  if (storageError) sections.push(jsx(Note, { warn: true, children: t('storageError', storageError) }, 'st'))
 
   return jsx('div', { className: 'flex h-full flex-col gap-3 overflow-auto p-3', children: sections })
 }
@@ -1274,7 +1256,6 @@ const I18N = {
     src_remembered: 'remembered catalog rates',
     src_unconfirmed: slug => `⚠ provider unconfirmed — rates borrowed from ${slug}`,
     storageError: msg => `⚠ The ledger could not be saved (${msg}). New usage is kept only until Hermes restarts.`,
-    subtotal: 'Subtotal',
     today: 'today',
     total: 'Total',
     unpricedNote: n => `${n} tokens had no known rate and are not in the total (shown as ≥).`
@@ -1335,7 +1316,6 @@ const I18N = {
     src_remembered: '历史目录价格',
     src_unconfirmed: slug => `⚠ 供应商未确认，借用了 ${slug} 的价格`,
     storageError: msg => `⚠ 账本保存失败（${msg}）。新用量只保留到 Hermes 重启前。`,
-    subtotal: '小计',
     today: '今日',
     total: '合计',
     unpricedNote: n => `有 ${n} 令牌没有可用单价，未计入总额（显示为 ≥）。`

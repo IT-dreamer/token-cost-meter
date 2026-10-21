@@ -57,7 +57,7 @@ cp desktop/plugin.js ~/.hermes/desktop-plugins/token-cost-meter/
 **状态栏芯片** —— 输入/输出 token、本次会话花费、缓存命中率，以及今日累计。悬停查看详情。
 
 **右侧面板** —— 本次会话的 token 明细、当前适用的单价、提示词缓存区块
-（命中率、缓存 vs 新增、节省金额），以及今日 / 近 7 天 / 本月的小计。
+（命中率、缓存 vs 新增、节省金额）。按时间区间的汇总统一放在账本整页。
 
 <img src="image/session-pane-zh.png" alt="会话面板：claude-opus-5 运行于 github-copilot，花费 $12.45，合计 15.22M 令牌，缓存命中率 97%，已节省 $65.73，单价 $5/$25/$0.5 每百万令牌" width="340">
 
