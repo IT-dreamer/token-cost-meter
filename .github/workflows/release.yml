@@ -20,6 +20,7 @@ jobs:
       - name: Check tag matches plugin.yaml version
         run: |
           tag="${GITHUB_REF_NAME#v}"
+          tag="${tag%%-*}"   # v1.1.0-rc.1 checks against 1.1.0
           ver="$(sed -n 's/^version: *"\{0,1\}\([^"]*\)"\{0,1\}$/\1/p' plugin.yaml)"
           echo "tag=$tag plugin.yaml=$ver"
           [ "$tag" = "$ver" ] || { echo "::error::tag v$tag != plugin.yaml $ver"; exit 1; }
