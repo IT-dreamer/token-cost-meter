@@ -3,19 +3,25 @@
  * persistent local ledger that survives restarting Hermes.
  *
  * Live  : host.state.focusedUsage (streamed UsageStats, no RPC)
- * Prices: host.request('model.options') -> pricing[model] = {input,output,cache}
- *         as "$/Mtok" strings ("free", "" = unknown). Last-known rates are
- *         persisted so costs still render when the catalog is unreachable.
- * Ledger: ctx.storage (namespaced persistence). The gateway's in-memory session
- *         counters reset on restart, so we fold them into per-day / per-model
- *         totals as they arrive, using per-session delta snapshots.
+ * Prices: host.request('model.options', { session_id }) — scoped to the
+ *         session whose usage is being priced, so a split tile never borrows
+ *         another tile's provider. pricing[model] = {input,output,cache} as
+ *         "$/Mtok" strings ("free", "" = unknown).
+ * Ledger: ctx.storage (namespaced, app-level — shared by every profile). The
+ *         gateway's in-memory counters reset on restart, so usage is folded
+ *         into per-day buckets keyed by profile + provider + model, and the
+ *         cost of every delta is SETTLED at the moment it is recorded, with
+ *         the rate source that priced it. Re-pricing history at read time
+ *         would make yesterday's total move whenever a catalog changes.
  */
 
 import {
   atom,
   Badge,
+  Button,
   cn,
   host,
+  queryClient,
   SegmentedControl,
   Tip,
   usePluginI18n,
@@ -25,8 +31,17 @@ import {
 import { jsx, jsxs } from 'react/jsx-runtime'
 
 const ID = 'token-cost-meter'
-const LEDGER_KEY = 'ledger.v1'
-const KEEP_DAYS = 120
+const LEDGER_KEY = 'ledger.v2'
+/** Pre-2.0 ledger. Migrated on first load and left untouched as a backup. */
+const LEGACY_LEDGER_KEY = 'ledger.v1'
+const LEDGER_VERSION = 2
+/** Calendar days of per-day totals kept (by date, not by count). */
+const KEEP_DAYS = 400
+/** Per-session counter snapshots older than this are dropped. */
+const SNAPSHOT_TTL_MS = 30 * 86_400_000
+const MAX_SNAPSHOTS = 2000
+const CATALOG_STALE_MS = 10 * 60 * 1000
+const M = 1_000_000
 
 /* ------------------------------------------------------------------ utils */
 
@@ -37,7 +52,7 @@ function parseRate(text) {
   if (!s || s === '?') return null
   if (s.toLowerCase() === 'free') return 0
   const n = Number.parseFloat(s.replace(/[$,\s]/g, ''))
-  return Number.isFinite(n) ? n : null
+  return Number.isFinite(n) && n >= 0 ? n : null
 }
 
 function fmtTokens(n) {
@@ -57,9 +72,16 @@ function fmtUsd(v) {
 
 /** Local calendar day, not UTC — "today" must mean the user's today. */
 function dayKey(ts) {
-  const d = ts ? new Date(ts) : new Date()
+  const d = ts != null ? new Date(ts) : new Date()
   const p = n => String(n).padStart(2, '0')
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`
+}
+
+/** The local day `n` calendar days before `now` (DST-safe: no 86.4M ms math). */
+function daysAgoKey(n, now) {
+  const d = now != null ? new Date(now) : new Date()
+  d.setDate(d.getDate() - n)
+  return dayKey(d.getTime())
 }
 
 function num(v) {
@@ -67,21 +89,26 @@ function num(v) {
   return Number.isFinite(n) && n > 0 ? n : 0
 }
 
-const EMPTY_BUCKET = () => ({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, calls: 0 })
+function tokensOf(b) {
+  return num(b.input) + num(b.output) + num(b.cacheRead) + num(b.cacheWrite)
+}
+
+function validRates(r) {
+  return !!r && ['input', 'output', 'cache'].every(k => typeof r[k] === 'number' && Number.isFinite(r[k]) && r[k] >= 0)
+}
 
 /* ---------------------------------------------------------------- pricing */
 
 /**
  * Bundled fallback rates, generated from the models.dev catalog by
- * scripts/gen-rates.py in this folder (the desktop plugin loader forbids
- * relative imports, so the table is inlined).
+ * scripts/gen-rates.py (the desktop plugin loader forbids relative imports,
+ * so the table is inlined).
  *
  * WHY this exists: Hermes only fetches LIVE pricing for openrouter / nous /
  * ai-gateway / novita / deepinfra / fireworks / kilocode
  * (hermes_cli/models_pricing.py::_PRICING_FETCHERS). Every other provider —
  * notably subscription/OAuth routes like github-copilot — gets `pricing: {}`
- * in `model.options`, so without this table the pane says "pricing
- * unavailable" even though models.dev knows the rates.
+ * in `model.options`.
  *
  * Shape: { providerId: { modelIdLowercase: [inUsdPerMtok, outUsdPerMtok, cacheReadUsdPerMtok?] } }
  */
@@ -126,29 +153,43 @@ function modelAliases(model) {
   return [...out].filter(Boolean)
 }
 
-/** Look the model up in the bundled table. Prefers the active provider. */
-function fallbackRates(model, provider) {
-  if (!model) return null
-  const names = modelAliases(model)
-  const slug = String(provider || '').toLowerCase()
-  const preferred = PROVIDER_ALIASES[slug] || slug
-
-  const fromTable = table => {
-    if (!table) return null
-    for (const n of names) {
-      const r = table[n]
-      if (r) return { cache: r[2] ?? r[0], input: r[0], output: r[1] }
-    }
-    return null
-  }
-
-  const own = fromTable(FALLBACK_RATES[preferred])
-  if (own) return own
-  for (const id of Object.keys(FALLBACK_RATES)) {
-    const hit = fromTable(FALLBACK_RATES[id])
-    if (hit) return hit
+function tableRates(table, names) {
+  if (!table) return null
+  for (const n of names) {
+    const r = table[n]
+    if (Array.isArray(r)) return { cache: r[2] ?? r[0], input: r[0], output: r[1] ?? 0 }
   }
   return null
+}
+
+/**
+ * Bundled models.dev lookup. `own` is true only when the hit came from the
+ * table of the provider actually serving the model; any other provider's row
+ * is a borrowed price and must be labelled as such.
+ */
+function bundledLookup(model, provider) {
+  if (!model) return null
+  const names = modelAliases(model)
+  const slug = String(provider || '').toLowerCase().trim()
+  const preferred = slug ? PROVIDER_ALIASES[slug] || slug : ''
+  if (preferred) {
+    const own = tableRates(FALLBACK_RATES[preferred], names)
+    if (own) return { own: true, rates: own, source: preferred }
+  }
+  for (const id of Object.keys(FALLBACK_RATES).sort()) {
+    if (id === preferred) continue
+    const hit = tableRates(FALLBACK_RATES[id], names)
+    if (hit) return { own: false, rates: hit, source: id }
+  }
+  return null
+}
+
+/** Same identity rule as the app's catalogProviderMatches: slug, name or alias. */
+function providerMatches(row, provider) {
+  if (!row || !provider) return false
+  const want = String(provider).toLowerCase()
+  const eq = v => typeof v === 'string' && v.toLowerCase() === want
+  return eq(row.slug) || eq(row.name) || (Array.isArray(row.aliases) && row.aliases.some(eq))
 }
 
 /** Pull the pricing entry for a model out of a model.options payload. */
@@ -156,30 +197,27 @@ function findPricing(payload, model, provider) {
   if (!payload || !Array.isArray(payload.providers) || !model) return null
   const rows = payload.providers
   const want = String(model)
-  const prefer = provider ? String(provider).toLowerCase() : null
+  const tail = want.includes('/') ? want.split('/').pop() : want
 
   const pick = row => {
     const p = row && row.pricing
-    if (!p) return null
+    if (!p || typeof p !== 'object') return null
     if (p[want]) return { row, entry: p[want] }
-    const tail = want.includes('/') ? want.split('/').pop() : want
     for (const key of Object.keys(p)) {
-      if (key === tail || (key.includes('/') && key.split('/').pop() === tail)) {
-        return { row, entry: p[key] }
-      }
+      if (key === tail || (key.includes('/') && key.split('/').pop() === tail)) return { row, entry: p[key] }
     }
     return null
   }
 
-  if (prefer) {
-    const hit = pick(rows.find(r => String(r.slug || '').toLowerCase() === prefer))
+  const ownRow = provider ? rows.find(r => providerMatches(r, provider)) : null
+  if (ownRow) {
+    const hit = pick(ownRow)
     if (hit) return { ...hit, ownProvider: true }
   }
-  // A foreign row that happens to list the same model id. Its rates are that
-  // provider's, NOT the active one's (nous and github-copilot both carry
-  // claude-opus-5 at different prices), so flag it instead of passing it off
-  // as the current provider.
+  // A foreign row listing the same model id. Its rates are THAT provider's
+  // (nous and github-copilot both carry claude-opus-5 at different prices).
   for (const row of rows) {
+    if (row === ownRow) continue
     const hit = pick(row)
     if (hit) return { ...hit, ownProvider: false }
   }
@@ -198,6 +236,40 @@ function toRates(entry) {
   return { input, output, cache }
 }
 
+function rateKey(provider, model) {
+  return `${String(provider || '').toLowerCase()}|${model}`
+}
+
+/**
+ * Resolve the rates for (model, provider). Order:
+ *   1. live catalog row of the serving provider          -> 'live'
+ *   2. rates remembered from an earlier live hit there    -> 'remembered'
+ *   3. bundled models.dev table of the serving provider   -> 'bundled'
+ *   4. anything else (another provider's catalog/table)   -> 'foreign' (+ slug)
+ * When the serving provider is unknown, 1–3 are impossible and every price is
+ * borrowed: `providerUnknown` lets the UI say so instead of implying a match.
+ */
+function resolveRates({ model, provider, payload, remembered }) {
+  const p = String(provider || '').trim()
+  const base = { foreignSlug: null, provider: p || null, providerUnknown: !p }
+  if (!model) return { ...base, origin: 'none', rates: null }
+
+  const found = findPricing(payload, model, p || null)
+  if (p) {
+    const live = found && found.ownProvider ? toRates(found.entry) : null
+    if (live) return { ...base, origin: 'live', rates: live }
+    const saved = remembered && remembered[rateKey(p, model)]
+    if (validRates(saved)) return { ...base, origin: 'remembered', rates: saved }
+    const own = bundledLookup(model, p)
+    if (own && own.own) return { ...base, origin: 'bundled', rates: own.rates }
+  }
+  const foreignLive = found && !found.ownProvider ? toRates(found.entry) : null
+  if (foreignLive) return { ...base, foreignSlug: found.row.slug || '?', origin: 'foreign', rates: foreignLive }
+  const borrowed = bundledLookup(model, p || null)
+  if (borrowed) return { ...base, foreignSlug: borrowed.source, origin: 'foreign', rates: borrowed.rates }
+  return { ...base, origin: 'none', rates: null }
+}
+
 /**
  * Hermes' CanonicalUsage splits prompt = input + cache_read + cache_write, so
  * bill each stream at its own rate (cache writes have no separate catalog
@@ -205,7 +277,6 @@ function toRates(entry) {
  */
 function costOf(bucket, rates) {
   if (!bucket || !rates) return null
-  const M = 1_000_000
   const parts = {
     input: (num(bucket.input) * rates.input) / M,
     cacheRead: (num(bucket.cacheRead) * rates.cache) / M,
@@ -215,196 +286,331 @@ function costOf(bucket, rates) {
   return { parts, total: parts.input + parts.cacheRead + parts.cacheWrite + parts.output }
 }
 
-/**
- * Cache economics for a bucket.
- *
- * `prompt = input + cacheRead + cacheWrite` in Hermes' CanonicalUsage, so the
- * hit rate is cacheRead over the whole prompt side. Savings is what those
- * cached tokens would have cost at the full input rate minus what they
- * actually cost at the cache rate; cache writes are a surcharge only when the
- * provider prices them above input (we bill them at the input rate, so they
- * are neutral here and excluded).
- */
-function cacheStats(bucket, rates) {
-  if (!bucket) return null
-  const read = num(bucket.cacheRead)
-  const write = num(bucket.cacheWrite)
-  const prompt = num(bucket.input) + read + write
-  if (!prompt) return null
-
-  const hitPct = (read / prompt) * 100
-  let saved = null
-  let wouldHaveCost = null
-  if (rates) {
-    const M = 1_000_000
-    wouldHaveCost = (read * rates.input) / M
-    saved = wouldHaveCost - (read * rates.cache) / M
-  }
-  return { hitPct, prompt, read, saved, wouldHaveCost, write }
+/** What cache reads saved versus paying the full input rate for them. */
+function cacheSavings(cacheRead, rates) {
+  if (!rates) return null
+  return (num(cacheRead) * Math.max(0, rates.input - rates.cache)) / M
 }
 
 /**
- * UsageStats -> the five numbers the ledger tracks.
+ * UsageStats -> the token streams the ledger tracks.
  *
- * The gateway's `_get_usage` (tui_gateway/server.py) does NOT send raw
- * cache_read/cache_write counts — only a rounded `cache_hit_pct`, and only
- * when there were cache reads. But it does send both `input` (which is
- * session_input_tokens, falling back to session_prompt_tokens) and `prompt`
- * (session_prompt_tokens = input + cache_read + cache_write).
+ * The gateway's `_get_usage` sends `input` (session_input_tokens, falling back
+ * to session_prompt_tokens), `prompt` (= input + cache_read + cache_write) and
+ * a ROUNDED `cache_hit_pct` that is present only when cache_read > 0. Raw
+ * cache_read / cache_write are honoured when a producer sends them.
  *
- * So we recover the cached volume two ways, in order:
- *   1. prompt - input, when the provider splits them (exact);
- *   2. prompt * cache_hit_pct, when input already equals prompt (derived).
- * Cache writes are not separable from this payload and stay 0 — they bill at
- * the input rate anyway, so the cost total is unaffected.
+ *   - raw cache fields present        -> exact.
+ *   - prompt > input, no hit%         -> the gap is all cache WRITES (exact:
+ *                                        hit% is omitted only when reads = 0).
+ *   - prompt > input, hit% present    -> reads ≈ prompt × hit%, capped at the
+ *                                        gap; the rest are writes. ESTIMATED.
+ *   - prompt == input, hit% present   -> input fell back to prompt; split it by
+ *                                        hit%. ESTIMATED.
+ * `input` is never reduced twice: the gap already excludes fresh input.
  */
 function readUsage(u) {
   const input = num(u.input)
   const prompt = num(u.prompt)
-  const hitPct = typeof u.cache_hit_pct === 'number' ? u.cache_hit_pct : null
+  const rawHit = Number(u.cache_hit_pct)
+  const hitPct = u.cache_hit_pct != null && Number.isFinite(rawHit) ? Math.max(0, Math.min(100, rawHit)) : null
+  const base = { calls: num(u.calls), output: num(u.output) }
 
-  let cacheRead = num(u.cache_read)
-  let fresh = input
-  if (!cacheRead && prompt) {
-    if (prompt > input) {
-      cacheRead = prompt - input
-    } else if (hitPct != null && hitPct > 0) {
-      cacheRead = Math.round((prompt * hitPct) / 100)
-      fresh = Math.max(0, prompt - cacheRead)
-    }
+  const hasRaw = u.cache_read != null || u.cache_write != null
+  if (hasRaw) {
+    const cacheRead = num(u.cache_read)
+    const cacheWrite = num(u.cache_write)
+    const cached = cacheRead + cacheWrite
+    // `input` carries the whole prompt when the provider had no split.
+    const fresh = prompt && input === prompt && input >= cached ? input - cached : input
+    return { ...base, cacheEstimated: false, cacheRead, cacheWrite, input: fresh }
   }
-  if (cacheRead && fresh === input && input >= cacheRead) fresh = input - cacheRead
 
-  return {
-    calls: num(u.calls),
-    cacheRead,
-    cacheWrite: num(u.cache_write),
-    input: fresh,
-    output: num(u.output)
+  if (prompt > input) {
+    const gap = prompt - input
+    if (hitPct == null) return { ...base, cacheEstimated: false, cacheRead: 0, cacheWrite: gap, input }
+    const cacheRead = Math.min(gap, Math.round((prompt * hitPct) / 100))
+    return { ...base, cacheEstimated: true, cacheRead, cacheWrite: gap - cacheRead, input }
   }
+
+  if (prompt && hitPct != null && hitPct > 0) {
+    const cacheRead = Math.min(prompt, Math.round((prompt * hitPct) / 100))
+    return { ...base, cacheEstimated: true, cacheRead, cacheWrite: 0, input: prompt - cacheRead }
+  }
+
+  return { ...base, cacheEstimated: false, cacheRead: 0, cacheWrite: 0, input }
+}
+
+/** Prompt-cache hit rate of a bucket, in percent (null without prompt tokens). */
+function hitPctOf(b) {
+  const prompt = num(b.input) + num(b.cacheRead) + num(b.cacheWrite)
+  return prompt ? (num(b.cacheRead) / prompt) * 100 : null
 }
 
 /* ----------------------------------------------------------------- ledger */
 
+/**
+ * v2 shape:
+ *   days[YYYY-MM-DD][bucketKey] = Bucket   (bucketKey = profile+provider+model)
+ *   snapshots[sid::model]       = last cumulative reading (+ costUsd, at)
+ *   rates[provider|model]       = last live catalog rates for that route
+ *   legacyRates[model]          = v1's provider-less remembered rates
+ *   since                       = first day this ledger has data for
+ */
 function emptyLedger() {
-  return { v: 1, days: {}, snapshots: {}, rates: {} }
+  return { v: LEDGER_VERSION, days: {}, legacyRates: {}, rates: {}, since: null, snapshots: {} }
 }
 
-/** Live mirror of the persisted ledger so React re-renders on every commit. */
-const $ledger = atom(emptyLedger())
-const $range = atom('today')
-let storage = null
+function bucketKey(profile, provider, model, legacy) {
+  return JSON.stringify([profile || '', provider || '', model, legacy ? 1 : 0])
+}
 
-function loadLedger() {
-  if (!storage) return emptyLedger()
-  const raw = storage.get(LEDGER_KEY, null)
-  if (!raw || typeof raw !== 'object' || raw.v !== 1) return emptyLedger()
+function newBucket({ legacy = false, model, profile = '', provider = '' }) {
   return {
-    v: 1,
-    days: raw.days && typeof raw.days === 'object' ? raw.days : {},
-    snapshots: raw.snapshots && typeof raw.snapshots === 'object' ? raw.snapshots : {},
-    rates: raw.rates && typeof raw.rates === 'object' ? raw.rates : {}
+    cacheEstimated: false,
+    cacheRead: 0,
+    cacheWrite: 0,
+    calls: 0,
+    cost: 0,
+    input: 0,
+    legacy,
+    model,
+    output: 0,
+    pricedTokens: 0,
+    profile,
+    provider,
+    saved: 0,
+    sources: {},
+    unpricedTokens: 0
   }
 }
 
-function saveLedger(next) {
-  $ledger.set(next)
-  if (storage) {
-    try {
-      storage.set(LEDGER_KEY, next)
-    } catch {
-      /* quota / private mode — the in-memory mirror still works this session */
+const isObj = v => !!v && typeof v === 'object' && !Array.isArray(v)
+
+/** v1 stored tokens only, keyed by model, and re-priced them on every read. */
+function migrateV1(raw, now) {
+  const led = emptyLedger()
+  const at = now ?? Date.now()
+  for (const [date, models] of Object.entries(isObj(raw.days) ? raw.days : {})) {
+    if (!isObj(models)) continue
+    const day = {}
+    for (const [model, b] of Object.entries(models)) {
+      if (!isObj(b)) continue
+      const nb = newBucket({ legacy: true, model })
+      nb.input = num(b.input)
+      nb.output = num(b.output)
+      nb.cacheRead = num(b.cacheRead)
+      nb.cacheWrite = num(b.cacheWrite)
+      nb.calls = num(b.calls)
+      nb.cost = null
+      day[bucketKey('', '', model, true)] = nb
     }
+    if (Object.keys(day).length) led.days[date] = day
+  }
+  for (const [k, s] of Object.entries(isObj(raw.snapshots) ? raw.snapshots : {})) {
+    if (isObj(s)) led.snapshots[k] = { ...s, at }
+  }
+  for (const [model, r] of Object.entries(isObj(raw.rates) ? raw.rates : {})) {
+    if (validRates(r)) led.legacyRates[model] = r
+  }
+  led.since = Object.keys(led.days).sort()[0] || null
+  return led
+}
+
+function normalizeV2(raw) {
+  if (!isObj(raw) || raw.v !== LEDGER_VERSION) return null
+  return {
+    v: LEDGER_VERSION,
+    days: isObj(raw.days) ? raw.days : {},
+    legacyRates: isObj(raw.legacyRates) ? raw.legacyRates : {},
+    rates: isObj(raw.rates) ? raw.rates : {},
+    since: typeof raw.since === 'string' ? raw.since : null,
+    snapshots: isObj(raw.snapshots) ? raw.snapshots : {}
   }
 }
 
-function prune(days) {
-  const keys = Object.keys(days).sort()
-  if (keys.length <= KEEP_DAYS) return days
-  const keep = new Set(keys.slice(-KEEP_DAYS))
+/** -> { ledger, migrated } from a ctx.storage-like `{ get(key, fallback) }`. */
+function readStoredLedger(store, now) {
+  if (!store) return { ledger: emptyLedger(), migrated: false }
+  const v2 = normalizeV2(store.get(LEDGER_KEY, null))
+  if (v2) return { ledger: v2, migrated: false }
+  const v1 = store.get(LEGACY_LEDGER_KEY, null)
+  if (isObj(v1) && v1.v === 1) return { ledger: migrateV1(v1, now), migrated: true }
+  return { ledger: emptyLedger(), migrated: false }
+}
+
+function pruneDays(days, now) {
+  const cutoff = daysAgoKey(KEEP_DAYS - 1, now)
   const out = {}
-  for (const k of keys) if (keep.has(k)) out[k] = days[k]
+  for (const k of Object.keys(days)) if (k >= cutoff) out[k] = days[k]
   return out
 }
 
+function pruneSnapshots(snaps, now) {
+  const fresh = Object.entries(snaps).filter(([, s]) => isObj(s) && now - num(s.at) <= SNAPSHOT_TTL_MS)
+  if (fresh.length > MAX_SNAPSHOTS) fresh.sort((a, b) => num(b[1].at) - num(a[1].at)).length = MAX_SNAPSHOTS
+  return Object.fromEntries(fresh)
+}
+
 /**
- * Fold one session's cumulative counters into the ledger.
+ * Fold one session's cumulative counters into the ledger (pure).
  *
- * The counters are cumulative per LIVE agent and reset to 0 on restart, /new
- * and /reset, so we diff against the last snapshot for that session+model and
- * add only the delta. A counter that went backwards means a fresh run: adopt
- * the new reading whole.
+ * Counters are cumulative per LIVE agent and reset on restart, /new and
+ * /reset, so we diff against the last snapshot for session+model and add only
+ * the delta; a counter that went backwards is a fresh run, adopted whole.
+ * The delta is priced NOW, with the rates of the route that served it, and
+ * the dollars are stored — history never re-prices.
+ *
+ * Returns the same object when nothing changed.
  */
-function commitUsage(sessionId, usage) {
-  if (!sessionId || !usage) return
+function applyUsage(led, { now = Date.now(), payload = null, profile = '', provider = '', sessionId, usage }) {
+  if (!sessionId || !usage) return led
   const model = String(usage.model || '').trim()
-  if (!model) return
+  if (!model) return led
 
-  const now = readUsage(usage)
-  if (!now.input && !now.output && !now.cacheRead && !now.cacheWrite) return
+  const cur = readUsage(usage)
+  if (!tokensOf(cur)) return led
 
-  const led = $ledger.get()
+  const gatewayCost =
+    typeof usage.cost_usd === 'number' && Number.isFinite(usage.cost_usd) && usage.cost_usd > 0 ? usage.cost_usd : null
   const snapKey = `${sessionId}::${model}`
   const prev = led.snapshots[snapKey]
   const restarted =
     !prev ||
-    now.input < num(prev.input) ||
-    now.output < num(prev.output) ||
-    now.cacheRead < num(prev.cacheRead) ||
-    now.calls < num(prev.calls)
+    cur.input < num(prev.input) ||
+    cur.output < num(prev.output) ||
+    cur.cacheRead < num(prev.cacheRead) ||
+    cur.cacheWrite < num(prev.cacheWrite) ||
+    cur.calls < num(prev.calls)
 
   const delta = restarted
-    ? now
+    ? cur
     : {
-        input: now.input - num(prev.input),
-        output: now.output - num(prev.output),
-        cacheRead: now.cacheRead - num(prev.cacheRead),
-        cacheWrite: now.cacheWrite - num(prev.cacheWrite),
-        calls: now.calls - num(prev.calls)
+        cacheRead: cur.cacheRead - num(prev.cacheRead),
+        cacheWrite: cur.cacheWrite - num(prev.cacheWrite),
+        calls: cur.calls - num(prev.calls),
+        input: cur.input - num(prev.input),
+        output: cur.output - num(prev.output)
       }
-
+  const deltaTokens = tokensOf(delta)
   // Nothing new — don't churn storage on every mid-turn tick.
-  if (!delta.input && !delta.output && !delta.cacheRead && !delta.cacheWrite && !delta.calls) return
+  if (!deltaTokens && !delta.calls) return led
 
-  const day = dayKey()
+  const resolved = resolveRates({ model, payload, provider, remembered: led.rates })
+  let costDelta = null
+  let source = 'none'
+  const prevGateway = prev && typeof prev.costUsd === 'number' ? prev.costUsd : null
+  if (gatewayCost != null && (restarted || (prevGateway != null && gatewayCost >= prevGateway))) {
+    costDelta = restarted ? gatewayCost : gatewayCost - prevGateway
+    source = 'gateway'
+  } else if (resolved.rates) {
+    costDelta = costOf(delta, resolved.rates).total
+    source = resolved.origin
+  }
+
+  const day = dayKey(now)
+  const key = bucketKey(profile, provider, model, false)
   const days = { ...led.days }
   const forDay = { ...(days[day] || {}) }
-  const b = { ...(forDay[model] || EMPTY_BUCKET()) }
+  const b = forDay[key] ? { ...forDay[key], sources: { ...forDay[key].sources } } : newBucket({ model, profile, provider })
   b.input += delta.input
   b.output += delta.output
   b.cacheRead += delta.cacheRead
   b.cacheWrite += delta.cacheWrite
   b.calls += delta.calls
-  forDay[model] = b
+  if (cur.cacheEstimated && delta.cacheRead) b.cacheEstimated = true
+  if (costDelta != null) {
+    b.cost += costDelta
+    b.pricedTokens += deltaTokens
+    b.sources[source] = num(b.sources[source]) + deltaTokens
+    if (source === 'foreign' && resolved.foreignSlug) b.foreignSlug = resolved.foreignSlug
+  } else {
+    b.unpricedTokens += deltaTokens
+  }
+  if (resolved.rates) b.saved += cacheSavings(delta.cacheRead, resolved.rates)
+  forDay[key] = b
   days[day] = forDay
 
-  saveLedger({ ...led, days: prune(days), snapshots: { ...led.snapshots, [snapKey]: now } })
+  const rates =
+    resolved.origin === 'live' && provider ? { ...led.rates, [rateKey(provider, model)]: resolved.rates } : led.rates
+  const snapshots = pruneSnapshots({ ...led.snapshots, [snapKey]: { ...cur, at: now, costUsd: gatewayCost } }, now)
+  const pruned = pruneDays(days, now)
+  const since = led.since && led.since <= day ? led.since : Object.keys(pruned).sort()[0] || day
+
+  return { ...led, days: pruned, rates, since, snapshots }
 }
 
-/** Remember catalog rates so a restart (or an offline app) still costs. */
-function rememberRates(model, rates) {
-  if (!model || !rates) return
-  const led = $ledger.get()
-  const old = led.rates[model]
-  if (old && old.input === rates.input && old.output === rates.output && old.cache === rates.cache) return
-  saveLedger({ ...led, rates: { ...led.rates, [model]: rates } })
+/** Rates for a legacy (v1, provider-less) bucket: its remembered rates, else a clearly borrowed price. */
+function legacyPricer(payload, legacyRates) {
+  return model => {
+    const saved = legacyRates && legacyRates[model]
+    if (validRates(saved)) return { origin: 'remembered', rates: saved }
+    return resolveRates({ model, payload, provider: '', remembered: null })
+  }
 }
 
-/** Sum buckets over the days matching `filter`, per model. */
-function aggregate(days, filter) {
-  const out = {}
-  for (const [date, models] of Object.entries(days)) {
-    if (!filter(date)) continue
-    for (const [model, b] of Object.entries(models)) {
-      const acc = out[model] || (out[model] = EMPTY_BUCKET())
-      acc.input += num(b.input)
-      acc.output += num(b.output)
-      acc.cacheRead += num(b.cacheRead)
-      acc.cacheWrite += num(b.cacheWrite)
-      acc.calls += num(b.calls)
+/**
+ * Sum buckets over the days matching `filter`, one row per
+ * profile+provider+model, plus totals for the range.
+ */
+function summarize(led, filter, priceLegacy) {
+  const rows = {}
+  for (const [date, buckets] of Object.entries(led.days)) {
+    if (!filter(date) || !isObj(buckets)) continue
+    for (const [key, b] of Object.entries(buckets)) {
+      if (!isObj(b)) continue
+      const r = rows[key] || (rows[key] = { ...newBucket(b), cost: b.legacy ? null : 0 })
+      for (const f of ['input', 'output', 'cacheRead', 'cacheWrite', 'calls', 'pricedTokens', 'unpricedTokens', 'saved']) {
+        r[f] += num(b[f])
+      }
+      if (!b.legacy) r.cost += num(b.cost)
+      if (b.cacheEstimated) r.cacheEstimated = true
+      if (b.foreignSlug) r.foreignSlug = b.foreignSlug
+      for (const [s, n] of Object.entries(isObj(b.sources) ? b.sources : {})) r.sources[s] = num(r.sources[s]) + num(n)
     }
   }
-  return out
+
+  const totals = {
+    cacheEstimated: false,
+    cost: 0,
+    foreignTokens: 0,
+    known: false,
+    legacyTokens: 0,
+    prompt: 0,
+    read: 0,
+    saved: 0,
+    unpricedTokens: 0
+  }
+  const list = Object.values(rows).map(r => {
+    if (r.legacy) {
+      const priced = priceLegacy ? priceLegacy(r.model) : null
+      r.legacyOrigin = priced ? priced.origin : 'none'
+      if (priced && priced.rates) {
+        r.cost = costOf(r, priced.rates).total
+        r.saved = cacheSavings(r.cacheRead, priced.rates)
+        r.foreignSlug = priced.foreignSlug || null
+      } else {
+        r.unpricedTokens = tokensOf(r)
+      }
+      totals.legacyTokens += tokensOf(r)
+    } else if (!r.pricedTokens) {
+      r.cost = null
+    }
+    if (r.cost != null) {
+      totals.cost += r.cost
+      totals.known = true
+    }
+    totals.saved += num(r.saved)
+    totals.read += num(r.cacheRead)
+    totals.prompt += num(r.input) + num(r.cacheRead) + num(r.cacheWrite)
+    totals.unpricedTokens += num(r.unpricedTokens)
+    totals.foreignTokens += num(r.sources.foreign) + (r.legacy && r.legacyOrigin === 'foreign' ? tokensOf(r) : 0)
+    if (r.cacheEstimated) totals.cacheEstimated = true
+    return r
+  })
+  list.sort((a, b) => num(b.cost) - num(a.cost) || tokensOf(b) - tokensOf(a))
+  totals.hitPct = totals.prompt ? (totals.read / totals.prompt) * 100 : null
+  return { rows: list, totals }
 }
 
 const RANGES = {
@@ -413,7 +619,7 @@ const RANGES = {
     return d => d === t
   },
   week: () => {
-    const since = dayKey(Date.now() - 6 * 86_400_000)
+    const since = daysAgoKey(6)
     return d => d >= since
   },
   month: () => {
@@ -423,153 +629,241 @@ const RANGES = {
   all: () => () => true
 }
 
-function sortModels(totals) {
-  return Object.keys(totals).sort(
-    (a, b) => totals[b].input + totals[b].output - (totals[a].input + totals[a].output)
-  )
+/* ----------------------------------------------------------------- export */
+
+/** CSV cell: quoted when needed, and neutralised against spreadsheet formula injection. */
+function csvCell(v) {
+  if (v == null) return ''
+  let s = String(v)
+  if (typeof v === 'string' && /^[=+\-@\t\r]/.test(s)) s = `'${s}`
+  return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s
+}
+
+const CSV_COLUMNS = [
+  'date', 'profile', 'provider', 'model', 'input', 'output', 'cache_read', 'cache_write', 'calls',
+  'cost_usd', 'cost_basis', 'priced_tokens', 'unpriced_tokens', 'cache_saved_usd', 'cache_estimated'
+]
+
+function costBasis(b) {
+  if (b.legacy) return 'legacy-unsettled'
+  const keys = Object.keys(b.sources || {}).filter(k => num(b.sources[k]))
+  return keys.sort().join('+') || 'none'
+}
+
+function ledgerCsv(led) {
+  const lines = [CSV_COLUMNS.join(',')]
+  for (const date of Object.keys(led.days).sort()) {
+    const buckets = Object.values(led.days[date] || {}).sort((a, b) => String(a.model).localeCompare(String(b.model)))
+    for (const b of buckets) {
+      lines.push(
+        [
+          date, b.profile || '', b.provider || '', b.model, num(b.input), num(b.output), num(b.cacheRead),
+          num(b.cacheWrite), num(b.calls), b.legacy || !num(b.pricedTokens) ? '' : Number(num(b.cost).toFixed(6)),
+          costBasis(b), num(b.pricedTokens), num(b.unpricedTokens), b.legacy ? '' : Number(num(b.saved).toFixed(6)),
+          b.cacheEstimated ? 'yes' : 'no'
+        ]
+          .map(csvCell)
+          .join(',')
+      )
+    }
+  }
+  return `${lines.join('\r\n')}\r\n`
+}
+
+/* ---------------------------------------------------------------- runtime */
+
+/** Live mirror of the persisted ledger so React re-renders on every commit. */
+const $ledger = atom(emptyLedger())
+const $range = atom('today')
+/** Last storage write failure (null when the latest write succeeded). */
+const $storageError = atom(null)
+let storage = null
+
+function saveLedger(next) {
+  $ledger.set(next)
+  if (!storage) return
+  try {
+    storage.set(LEDGER_KEY, next)
+    if ($storageError.get()) $storageError.set(null)
+  } catch (err) {
+    const message = String((err && err.message) || err)
+    if (!$storageError.get()) {
+      try {
+        host.notify({ kind: 'warning', message: `Token & Cost Meter: ledger not saved (${message})` })
+      } catch {
+        /* notify is best-effort */
+      }
+    }
+    $storageError.set(message)
+  }
+}
+
+function catalogQuery(sessionId) {
+  return {
+    queryFn: () => host.request('model.options', sessionId ? { session_id: sessionId } : {}),
+    queryKey: [ID, 'model-options', sessionId || 'global'],
+    retry: 1,
+    staleTime: CATALOG_STALE_MS
+  }
+}
+
+/** The session's model.options payload (cached; stale data beats none on error). */
+async function getCatalog(sessionId) {
+  const q = catalogQuery(sessionId)
+  try {
+    return await queryClient.fetchQuery(q)
+  } catch {
+    return queryClient.getQueryData(q.queryKey) ?? null
+  }
+}
+
+/**
+ * Owner profile of a session. Exact for the focused chat; other sessions fall
+ * back to the gateway socket's profile (the SDK exposes no per-session owner).
+ */
+function profileFor(sessionId) {
+  try {
+    if (sessionId && sessionId === host.state.focusedSessionId.get()) {
+      return host.state.focusedSessionProfile.get() || host.state.profile.get() || ''
+    }
+    return host.state.profile.get() || ''
+  } catch {
+    return ''
+  }
+}
+
+/** Per-session serial queue: readings for one session commit in arrival order. */
+const chains = new Map()
+
+function enqueueUsage(sessionId, usage) {
+  if (!sessionId || !usage) return null
+  const snapshot = { ...usage }
+  const profile = profileFor(sessionId)
+  const prev = chains.get(sessionId) || Promise.resolve()
+  const run = prev
+    .then(async () => {
+      const payload = await getCatalog(sessionId)
+      const provider = payload && typeof payload.provider === 'string' ? payload.provider : ''
+      const led = $ledger.get()
+      const next = applyUsage(led, { payload, profile, provider, sessionId, usage: snapshot })
+      if (next !== led) saveLedger(next)
+    })
+    .catch(err => console.warn(`[${ID}] usage not recorded:`, err))
+  chains.set(sessionId, run)
+  run.finally(() => {
+    if (chains.get(sessionId) === run) chains.delete(sessionId)
+  })
+  return run
+}
+
+async function writeClipboard(text) {
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(text)
+      return true
+    }
+  } catch {
+    /* fall through to the desktop bridge */
+  }
+  try {
+    const bridge = typeof window !== 'undefined' && window.hermesDesktop
+    if (bridge && typeof bridge.writeClipboard === 'function') {
+      await bridge.writeClipboard(text)
+      return true
+    }
+  } catch {
+    /* no clipboard */
+  }
+  return false
+}
+
+async function exportLedger(kind, t) {
+  const led = $ledger.get()
+  const text =
+    kind === 'csv' ? ledgerCsv(led) : JSON.stringify({ exportedAt: new Date().toISOString(), ledger: led }, null, 2)
+  if (kind === 'json-copy') {
+    const ok = await writeClipboard(text)
+    host.notify({ kind: ok ? 'success' : 'error', message: ok ? t('copied') : t('exportFailed') })
+    return
+  }
+  try {
+    const url = URL.createObjectURL(new Blob([text], { type: 'text/csv;charset=utf-8' }))
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `token-cost-ledger-${dayKey()}.csv`
+    document.body.appendChild(a)
+    a.click()
+    a.remove()
+    setTimeout(() => URL.revokeObjectURL(url), 10_000)
+  } catch {
+    const ok = await writeClipboard(text)
+    host.notify({ kind: ok ? 'info' : 'error', message: ok ? t('csvCopied') : t('exportFailed') })
+  }
 }
 
 /* ------------------------------------------------------------------ hooks */
 
-function usePricingPayload() {
-  return useQuery({
-    queryKey: [ID, 'model-options'],
-    queryFn: () => host.request('model.options', {}),
-    staleTime: 10 * 60 * 1000,
-    refetchInterval: 15 * 60 * 1000,
-    retry: 1
-  })
-}
-
-/** Rate resolver: live catalog first, remembered rates as the fallback. */
-function useRateLookup() {
-  const { data: payload, error, isLoading } = usePricingPayload()
-  const led = useValue($ledger)
-
-  const lookup = (model, provider) => {
-    if (!model) return { providerSlug: null, rates: null, remembered: false }
-    // 1. live catalog, but ONLY from the provider actually serving the model.
-    //    Hermes fetches live pricing for just 7 providers; a model id that also
-    //    exists on one of them (nous lists 856 models, incl. claude-opus-5)
-    //    must not lend its rates to the route you are really on.
-    const found = findPricing(payload, model, provider)
-    const live = found && found.ownProvider ? toRates(found.entry) : null
-    if (live) {
-      rememberRates(model, live)
-      return { origin: 'live', providerSlug: found.row.slug, rates: live, remembered: false }
-    }
-    // 2. rates remembered from an earlier live hit on this provider
-    const saved = led.rates[model]
-    if (saved) return { origin: 'remembered', providerSlug: provider || null, rates: saved, remembered: true }
-    // 3. bundled models.dev table — the path that covers copilot & friends
-    const bundled = fallbackRates(model, provider)
-    if (bundled) return { origin: 'bundled', providerSlug: provider || null, rates: bundled, remembered: false }
-    // 4. last resort: a foreign provider's rates, clearly labelled as such
-    const foreign = toRates(found && found.entry)
-    if (foreign) {
-      return { foreignSlug: found.row.slug, origin: 'foreign', providerSlug: provider || null, rates: foreign, remembered: false }
-    }
-    return { origin: 'none', providerSlug: provider || null, rates: null, remembered: false }
-  }
-
-  return {
-    error: error ? String(error.message || error) : null,
-    loading: isLoading,
-    lookup,
-    providerHint: payload && payload.provider ? payload.provider : null
-  }
-}
-
-/** The focused session's live numbers. */
+/** The focused session's live numbers, priced with ITS provider's catalog. */
 function useLive() {
+  const sessionId = useValue(host.state.focusedSessionId)
   const rawUsage = useValue(host.state.focusedUsage)
+  const stateModel = useValue(host.state.model)
+  const led = useValue($ledger)
+  const { data: payload, error, isLoading } = useQuery({ ...catalogQuery(sessionId), refetchInterval: 15 * 60 * 1000 })
+
   // After a restart the host seeds the focused session with an all-zero usage
-  // object (the gateway's counters live in process memory). Treat that as
-  // "nothing yet" so the UI falls back to the persisted ledger instead of
-  // advertising a live $0.00.
+  // object; treat that as "nothing yet" so the UI falls back to the ledger.
   const usage =
     rawUsage && (num(rawUsage.input) || num(rawUsage.output) || num(rawUsage.total) || num(rawUsage.calls))
       ? rawUsage
       : null
-  const stateModel = useValue(host.state.model)
-  const { error, loading, lookup, providerHint } = useRateLookup()
 
-  const model = (usage && usage.model) || stateModel || ''
-  const { foreignSlug, origin, providerSlug, rates, remembered } = lookup(model, providerHint)
+  const provider = payload && typeof payload.provider === 'string' ? payload.provider : ''
+  const model = (usage && usage.model) || (payload && payload.model) || stateModel || ''
+  const resolved = resolveRates({ model, payload, provider, remembered: led.rates })
   const bucket = usage ? readUsage(usage) : null
-  const computed = costOf(bucket, rates)
-  const cache = cacheStats(bucket, rates)
+  const computed = costOf(bucket, resolved.rates)
   const backendCost =
     usage && typeof usage.cost_usd === 'number' && usage.cost_usd > 0 ? usage.cost_usd : null
 
+  const gatewayHit = usage && typeof usage.cache_hit_pct === 'number' ? usage.cache_hit_pct : null
   return {
     bucket,
-    cache,
-    // The gateway's own rounded figure wins when present — it sees every call,
-    // including ones that never reached the focused usage snapshot.
-    cacheHitPct:
-      usage && typeof usage.cache_hit_pct === 'number'
-        ? usage.cache_hit_pct
-        : cache
-          ? cache.hitPct
-          : null,
-    computed,
+    cacheHitPct: gatewayHit != null ? gatewayHit : bucket ? hitPctOf(bucket) : null,
     cost: backendCost != null ? backendCost : computed ? computed.total : null,
-    costSource:
-      backendCost != null
-        ? 'gateway'
-        : computed
-          ? origin === 'bundled'
-            ? 'bundled'
-            : origin === 'foreign'
-              ? 'foreign'
-              : 'pricing'
-          : 'none',
-    foreignSlug,
+    costSource: backendCost != null ? 'gateway' : computed ? resolved.origin : 'none',
+    foreignSlug: resolved.foreignSlug,
     model,
-    pricingError: error,
-    pricingLoading: loading,
-    providerSlug,
-    rates,
-    remembered,
+    pricingError: error ? String(error.message || error) : null,
+    pricingLoading: isLoading,
+    provider: provider || null,
+    providerUnknown: !provider,
+    rates: resolved.rates,
+    saved: bucket && resolved.rates ? cacheSavings(bucket.cacheRead, resolved.rates) : null,
     usage
   }
 }
 
-/** Total cost of an aggregated range, using whatever rates we can resolve. */
-function rangeCost(totals, lookup) {
-  let sum = 0
-  let saved = 0
-  let read = 0
-  let prompt = 0
-  let known = false
-  for (const [model, b] of Object.entries(totals)) {
-    const { rates } = lookup(model, null)
-    const c = costOf(b, rates)
-    if (c) {
-      sum += c.total
-      known = true
-    }
-    const cache = cacheStats(b, rates)
-    if (cache) {
-      read += cache.read
-      prompt += cache.prompt
-      if (cache.saved != null) saved += cache.saved
-    }
-  }
-  return { hitPct: prompt ? (read / prompt) * 100 : null, known, saved, sum }
+/** Ledger summary for a range, legacy rows priced against the global catalog. */
+function useSummary(range) {
+  const led = useValue($ledger)
+  const { data: payload } = useQuery(catalogQuery(null))
+  return summarize(led, RANGES[range](), legacyPricer(payload, led.legacyRates))
 }
 
 /* --------------------------------------------------------------------- UI */
 
+function sourceLabel(t, origin, foreignSlug, providerUnknown) {
+  if (origin === 'foreign') return providerUnknown ? t('src_unconfirmed', foreignSlug || '?') : t('src_foreign', foreignSlug || '?')
+  return t(`src_${origin}`)
+}
+
 function Chip() {
   const t = usePluginI18n(ID)
   const live = useLive()
-  const led = useValue($ledger)
-  const { lookup } = useRateLookup()
-  const today = rangeCost(aggregate(led.days, RANGES.today()), lookup)
-
+  const today = useSummary('today').totals
   const open = () => host.navigate('/token-cost')
+  const todayText = today.known ? `${t('today')} ${fmtUsd(today.cost)}${today.unpricedTokens ? '+' : ''}` : null
 
   if (!live.usage) {
     return jsx(Tip, {
@@ -581,21 +875,20 @@ function Chip() {
         ),
         onClick: open,
         type: 'button',
-        children: today.known ? `${t('today')} ${fmtUsd(today.sum)}` : t('idle')
+        children: todayText || t('idle')
       })
     })
   }
 
-  const label = `${fmtTokens(live.usage.input)}↑ ${fmtTokens(live.usage.output)}↓`
-
+  const warn = live.costSource === 'foreign' || live.costSource === 'none'
   return jsx(Tip, {
     label: t(
       'chipTip',
       live.model || '—',
-      t(`src_${live.costSource}`),
-      fmtUsd(today.sum),
+      sourceLabel(t, live.costSource, live.foreignSlug, live.providerUnknown),
+      fmtUsd(today.cost),
       live.cacheHitPct != null ? `${Math.round(live.cacheHitPct)}%` : '—',
-      live.cache && live.cache.saved != null ? fmtUsd(live.cache.saved) : '—'
+      live.saved != null ? `${live.bucket && live.bucket.cacheEstimated ? '≈' : ''}${fmtUsd(live.saved)}` : '—'
     ),
     children: jsxs('button', {
       className: cn(
@@ -605,24 +898,16 @@ function Chip() {
       onClick: open,
       type: 'button',
       children: [
-        jsx('span', { children: label }),
+        jsx('span', { children: `${fmtTokens(live.usage.input)}↑ ${fmtTokens(live.usage.output)}↓` }),
         jsx('span', { className: 'text-(--ui-text-quaternary)', children: '·' }),
         jsx('span', {
-          className: live.cost == null ? 'text-(--ui-text-quaternary)' : 'text-(--ui-accent)',
-          children: live.cost == null ? t('noPrice') : fmtUsd(live.cost)
+          className: live.cost == null ? 'text-(--ui-text-quaternary)' : warn ? 'text-(--ui-warning)' : 'text-(--ui-accent)',
+          children: live.cost == null ? t('noPrice') : `${warn ? '⚠ ' : ''}${fmtUsd(live.cost)}`
         }),
         live.cacheHitPct != null
-          ? jsx('span', {
-              className: 'text-(--ui-text-quaternary)',
-              children: `· ⚡${Math.round(live.cacheHitPct)}%`
-            })
+          ? jsx('span', { className: 'text-(--ui-text-quaternary)', children: `· ⚡${Math.round(live.cacheHitPct)}%` })
           : null,
-        today.known
-          ? jsxs('span', {
-              className: 'text-(--ui-text-quaternary)',
-              children: ['· ', t('today'), ' ', fmtUsd(today.sum)]
-            })
-          : null
+        todayText ? jsx('span', { className: 'text-(--ui-text-quaternary)', children: `· ${todayText}` }) : null
       ].filter(Boolean)
     })
   })
@@ -654,27 +939,49 @@ function Section({ children, title }) {
   return jsxs('div', {
     className: 'flex flex-col gap-1',
     children: [
-      jsx('div', {
-        className: 'text-[0.625rem] tracking-wide text-(--ui-text-quaternary) uppercase',
-        children: title
-      }),
+      jsx('div', { className: 'text-[0.625rem] tracking-wide text-(--ui-text-quaternary) uppercase', children: title }),
       jsx('div', { className: 'flex flex-col gap-0.5 text-xs', children })
     ]
   })
+}
+
+function Note({ children, warn }) {
+  return jsx('div', {
+    className: cn('text-[0.6875rem] leading-relaxed', warn ? 'text-(--ui-warning)' : 'text-(--ui-text-quaternary)'),
+    children
+  })
+}
+
+/** Caveats for a range summary — shown wherever a total is shown. */
+function rangeNotes(t, totals, storageError) {
+  const notes = []
+  if (storageError) notes.push(jsx(Note, { warn: true, children: t('storageError', storageError) }, 'st'))
+  if (totals.unpricedTokens) notes.push(jsx(Note, { warn: true, children: t('unpricedNote', fmtTokens(totals.unpricedTokens)) }, 'up'))
+  if (totals.foreignTokens) notes.push(jsx(Note, { warn: true, children: t('foreignNote', fmtTokens(totals.foreignTokens)) }, 'fo'))
+  if (totals.legacyTokens) notes.push(jsx(Note, { children: t('legacyNote', fmtTokens(totals.legacyTokens)) }, 'lg'))
+  if (totals.cacheEstimated) notes.push(jsx(Note, { children: t('cacheEstNote') }, 'ce'))
+  return notes
+}
+
+function rowLabel(r) {
+  return r.provider ? `${r.model} · ${r.provider}` : r.model
 }
 
 /** Right-hand pane: live session on top, persisted totals below. */
 function Meter() {
   const t = usePluginI18n(ID)
   const live = useLive()
-  const led = useValue($ledger)
-  const { lookup } = useRateLookup()
-
+  const storageError = useValue($storageError)
+  const today = useSummary('today')
+  const week = useSummary('week')
+  const month = useSummary('month')
   const sections = []
 
   if (live.usage) {
     const u = live.usage
-    const b = live.bucket || { cacheRead: 0, cacheWrite: 0, input: 0, output: 0 }
+    const b = live.bucket
+    const approx = b.cacheEstimated ? '≈' : ''
+    const warn = live.costSource === 'foreign' || live.costSource === 'none'
     sections.push(
       jsxs(
         'div',
@@ -685,97 +992,51 @@ function Meter() {
               className: 'flex items-center justify-between gap-2',
               children: [
                 jsx('div', { className: 'truncate text-sm font-medium', children: live.model || '—' }),
-                live.providerSlug
-                  ? jsx(Tip, {
-                      label: t('providerTip', live.providerSlug),
-                      children: jsx(Badge, { variant: 'muted', children: live.providerSlug })
-                    })
-                  : null
-              ].filter(Boolean)
+                jsx(Tip, {
+                  label: live.provider ? t('providerTip', live.provider) : t('providerUnknownTip'),
+                  children: jsx(Badge, { variant: 'muted', children: live.provider || t('providerUnknown') })
+                })
+              ]
             }),
             jsxs('div', {
-              className: 'flex items-baseline gap-2',
+              className: 'flex flex-wrap items-baseline gap-x-2',
               children: [
                 jsx('div', {
                   className: 'text-2xl font-semibold tabular-nums text-(--ui-accent)',
                   children: live.cost == null ? '—' : fmtUsd(live.cost)
                 }),
                 jsx('span', {
-                  className: cn(
-                    'text-[0.625rem]',
-                    live.costSource === 'foreign' ? 'text-(--ui-warning)' : 'text-(--ui-text-quaternary)'
-                  ),
-                  children:
-                    (live.costSource === 'foreign'
-                      ? t('src_foreign', live.foreignSlug || '?')
-                      : t(`src_${live.costSource}`)) + (live.remembered ? ` · ${t('cachedRates')}` : '')
+                  className: cn('text-[0.625rem]', warn ? 'text-(--ui-warning)' : 'text-(--ui-text-quaternary)'),
+                  children: sourceLabel(t, live.costSource, live.foreignSlug, live.providerUnknown)
                 })
               ]
             }),
             jsx(Section, {
               title: t('sessionTokens'),
               children: [
-                jsx(Row, { label: t('input'), value: fmtTokens(b.input) }, 'i'),
+                jsx(Row, { label: t('input'), value: `${approx}${fmtTokens(b.input)}` }, 'i'),
                 jsx(Row, { label: t('output'), value: fmtTokens(b.output) }, 'o'),
-                b.cacheRead
-                  ? jsx(Row, { dim: true, label: t('cacheRead'), value: fmtTokens(b.cacheRead) }, 'cr')
-                  : null,
-                b.cacheWrite
-                  ? jsx(Row, { dim: true, label: t('cacheWrite'), value: fmtTokens(b.cacheWrite) }, 'cw')
-                  : null,
+                b.cacheRead ? jsx(Row, { dim: true, label: t('cacheRead'), value: `${approx}${fmtTokens(b.cacheRead)}` }, 'cr') : null,
+                b.cacheWrite ? jsx(Row, { dim: true, label: t('cacheWrite'), value: `${approx}${fmtTokens(b.cacheWrite)}` }, 'cw') : null,
                 jsx(Row, { label: t('total'), value: fmtTokens(u.total) }, 'tt'),
                 jsx(Row, { dim: true, label: t('calls'), value: String(u.calls ?? 0) }, 'c'),
                 typeof u.context_percent === 'number'
-                  ? jsx(
-                      Row,
-                      {
-                        dim: true,
-                        label: t('context'),
-                        value: `${Math.round(u.context_percent)}% · ${fmtTokens(u.context_used)}/${fmtTokens(u.context_max)}`
-                      },
-                      'ctx'
-                    )
+                  ? jsx(Row, {
+                      dim: true,
+                      label: t('context'),
+                      value: `${Math.round(u.context_percent)}% · ${fmtTokens(u.context_used)}/${fmtTokens(u.context_max)}`
+                    }, 'ctx')
                   : null
               ].filter(Boolean)
             }),
-            live.cache
+            live.cacheHitPct != null
               ? jsx(Section, {
                   title: t('cacheTitle'),
                   children: [
-                    jsx(
-                      'div',
-                      {
-                        className: 'flex items-baseline justify-between gap-3 tabular-nums',
-                        children: [
-                          jsx('span', { className: 'text-(--ui-text-tertiary)', children: t('hitRate') }),
-                          jsx('span', {
-                            className: 'font-medium text-(--ui-accent)',
-                            children: `${Math.round(live.cacheHitPct ?? 0)}%`
-                          })
-                        ]
-                      },
-                      'hr'
-                    ),
-                    jsx('div', { className: 'py-1', children: jsx(CacheBar, { pct: live.cacheHitPct ?? 0 }) }, 'bar'),
-                    jsx(
-                      Row,
-                      {
-                        dim: true,
-                        label: t('cachedVsFresh'),
-                        value: `${fmtTokens(live.cache.read)} / ${fmtTokens(live.cache.prompt - live.cache.read)}`
-                      },
-                      'cvf'
-                    ),
-                    live.cache.saved != null
-                      ? jsx(
-                          Row,
-                          {
-                            label: t('saved'),
-                            value: `${fmtUsd(live.cache.saved)} (${t('ofWould')} ${fmtUsd(live.cache.wouldHaveCost)})`
-                          },
-                          'sv'
-                        )
-                      : null
+                    jsx(Row, { label: t('hitRate'), value: `${Math.round(live.cacheHitPct)}%` }, 'hr'),
+                    jsx('div', { className: 'py-1', children: jsx(CacheBar, { pct: live.cacheHitPct }) }, 'bar'),
+                    live.saved != null ? jsx(Row, { label: t('saved'), value: `${approx}${fmtUsd(live.saved)}` }, 'sv') : null,
+                    b.cacheEstimated ? jsx(Note, { children: t('cacheEstNote') }, 'est') : null
                   ].filter(Boolean)
                 })
               : null,
@@ -788,11 +1049,8 @@ function Meter() {
                     jsx(Row, { dim: true, label: t('cacheRead'), value: `$${live.rates.cache}` }, 'rc')
                   ]
                 })
-              : jsx('div', {
-                  className: 'text-xs text-(--ui-text-quaternary)',
-                  children: live.pricingLoading
-                    ? t('loadingPrice')
-                    : live.pricingError || t('noPriceLong')
+              : jsx(Note, {
+                  children: live.pricingLoading ? t('loadingPrice') : live.pricingError || t('noPriceLong')
                 })
           ].filter(Boolean)
         },
@@ -800,108 +1058,82 @@ function Meter() {
       )
     )
   } else {
-    sections.push(
-      jsx('div', { className: 'text-xs text-(--ui-text-quaternary)', children: t('empty') }, 'live')
-    )
+    sections.push(jsx(Note, { children: t('empty') }, 'live'))
   }
 
-  for (const range of ['today', 'week', 'month']) {
-    const totals = aggregate(led.days, RANGES[range]())
-    const models = sortModels(totals)
-    if (!models.length) continue
-
-    const rows = models.map(model => {
-      const c = costOf(totals[model], lookup(model, null).rates)
-      return jsx(
-        Row,
-        {
-          label: model,
-          value: `${fmtTokens(totals[model].input + totals[model].output)} · ${c ? fmtUsd(c.total) : '—'}`
-        },
-        model
-      )
-    })
-    rows.push(jsx(Row, { label: t('subtotal'), value: fmtUsd(rangeCost(totals, lookup).sum) }, '__sum'))
-
+  for (const [range, s] of [['today', today], ['week', week], ['month', month]]) {
+    if (!s.rows.length) continue
+    const rows = s.rows.map((r, i) =>
+      jsx(Row, {
+        label: rowLabel(r),
+        value: `${fmtTokens(tokensOf(r))} · ${r.cost == null ? '—' : fmtUsd(r.cost)}`
+      }, `${i}`)
+    )
+    rows.push(jsx(Row, { label: t('subtotal'), value: s.totals.known ? fmtUsd(s.totals.cost) : '—' }, '__sum'))
     sections.push(jsx(Section, { title: t(`range_${range}`), children: rows }, range))
   }
+  sections.push(...rangeNotes(t, month.totals, storageError))
 
   return jsx('div', { className: 'flex h-full flex-col gap-3 overflow-auto p-3', children: sections })
 }
 
 /* -------------------------------------------------------------- full page */
 
+function rowBasis(t, r) {
+  if (r.legacy) return t('basisLegacy')
+  const kinds = Object.keys(r.sources).filter(k => num(r.sources[k]))
+  if (!kinds.length) return t('src_none')
+  if (kinds.length > 1) return t('basisMixed')
+  return kinds[0] === 'foreign' ? t('src_foreign', r.foreignSlug || '?') : t(`src_${kinds[0]}`)
+}
+
 function LedgerPage() {
   const t = usePluginI18n(ID)
   const led = useValue($ledger)
   const range = useValue($range)
-  const { lookup } = useRateLookup()
+  const storageError = useValue($storageError)
+  const { rows, totals } = useSummary(range)
+  const dayCount = Object.keys(led.days).length
 
-  const totals = aggregate(led.days, RANGES[range]())
-  const models = sortModels(totals)
-  const grand = rangeCost(totals, lookup)
-
-  const rows = models.map(model => {
-    const b = totals[model]
-    const { rates, remembered } = lookup(model, null)
-    const c = costOf(b, rates)
-    const cache = cacheStats(b, rates)
-
-    return jsxs(
-      'tr',
-      {
-        className: 'border-b border-(--ui-stroke-secondary)',
+  const cells = r => {
+    const pct = hitPctOf(r)
+    const approx = r.cacheEstimated ? '≈' : ''
+    const warn = r.legacy ? r.legacyOrigin === 'foreign' : num(r.sources.foreign) || r.unpricedTokens
+    return [
+      jsxs('td', {
+        className: 'py-1.5 pr-3',
         children: [
-          jsxs('td', {
-            className: 'py-1.5 pr-3',
-            children: [
-              jsx('span', { children: model }),
-              remembered
-                ? jsx('span', {
-                    className: 'ml-1.5 text-[0.625rem] text-(--ui-text-quaternary)',
-                    children: t('cachedRates')
-                  })
-                : null
-            ].filter(Boolean)
-          }),
-          jsx('td', { className: 'py-1.5 pr-3 text-right tabular-nums', children: fmtTokens(b.input) }),
-          jsx('td', { className: 'py-1.5 pr-3 text-right tabular-nums', children: fmtTokens(b.output) }),
-          jsx('td', {
-            className: 'py-1.5 pr-3 text-right tabular-nums text-(--ui-text-tertiary)',
-            children: fmtTokens(b.cacheRead)
-          }),
-          jsx('td', {
-            className: 'py-1.5 pr-3 text-right tabular-nums text-(--ui-text-tertiary)',
-            children: String(b.calls)
-          }),
-          jsx('td', {
-            className: 'py-1.5 pr-3 text-right tabular-nums',
-            children: cache ? `${Math.round(cache.hitPct)}%` : '—'
-          }),
-          jsx('td', {
-            className: 'py-1.5 pr-3 text-right tabular-nums text-(--ui-accent)',
-            children: cache && cache.saved != null ? fmtUsd(cache.saved) : '—'
-          }),
-          jsx('td', { className: 'py-1.5 text-right tabular-nums', children: c ? fmtUsd(c.total) : '—' })
+          jsx('div', { children: r.model }),
+          jsx('div', {
+            className: 'text-[0.625rem] text-(--ui-text-quaternary)',
+            children: [r.profile, r.provider || (r.legacy ? null : t('providerUnknown'))].filter(Boolean).join(' · ') || null
+          })
         ]
-      },
-      model
-    )
-  })
+      }),
+      jsx('td', { className: 'py-1.5 pr-3 text-right tabular-nums', children: `${approx}${fmtTokens(r.input)}` }),
+      jsx('td', { className: 'py-1.5 pr-3 text-right tabular-nums', children: fmtTokens(r.output) }),
+      jsx('td', { className: 'py-1.5 pr-3 text-right tabular-nums text-(--ui-text-tertiary)', children: `${approx}${fmtTokens(r.cacheRead)}` }),
+      jsx('td', { className: 'py-1.5 pr-3 text-right tabular-nums text-(--ui-text-tertiary)', children: String(r.calls) }),
+      jsx('td', { className: 'py-1.5 pr-3 text-right tabular-nums', children: pct == null ? '—' : `${approx}${Math.round(pct)}%` }),
+      jsx('td', { className: 'py-1.5 pr-3 text-right tabular-nums text-(--ui-accent)', children: r.saved ? `${approx}${fmtUsd(r.saved)}` : '—' }),
+      jsxs('td', {
+        className: 'py-1.5 text-right tabular-nums',
+        children: [
+          jsx('div', { children: r.cost == null ? '—' : `${r.unpricedTokens && r.cost != null ? '≥' : ''}${fmtUsd(r.cost)}` }),
+          jsx('div', {
+            className: cn('text-[0.625rem]', warn ? 'text-(--ui-warning)' : 'text-(--ui-text-quaternary)'),
+            children: rowBasis(t, r)
+          })
+        ]
+      })
+    ]
+  }
 
   const head = ['modelCol', 'input', 'output', 'cacheRead', 'calls', 'hitRate', 'saved', 'cost'].map((k, i) =>
-    jsx(
-      'th',
-      {
-        className: cn(
-          'pb-1.5 font-medium text-(--ui-text-quaternary)',
-          i === 0 ? 'pr-3 text-left' : 'pr-3 text-right',
-          k === 'cost' && 'pr-0'
-        ),
-        children: t(k)
-      },
-      k
-    )
+    jsx('th', {
+      className: cn('pb-1.5 font-medium text-(--ui-text-quaternary)', i === 0 ? 'pr-3 text-left' : 'pr-3 text-right', k === 'cost' && 'pr-0'),
+      children: t(k)
+    }, k)
   )
 
   return jsxs('div', {
@@ -913,76 +1145,194 @@ function LedgerPage() {
           jsx('h1', { className: 'text-base font-semibold', children: t('pageTitle') }),
           jsx(SegmentedControl, {
             onChange: v => $range.set(v),
-            options: [
-              { id: 'today', label: t('range_today') },
-              { id: 'week', label: t('range_week') },
-              { id: 'month', label: t('range_month') },
-              { id: 'all', label: t('range_all') }
-            ],
+            options: ['today', 'week', 'month', 'all'].map(id => ({ id, label: t(`range_${id}`) })),
             value: range
           })
         ]
       }),
-
       jsxs('div', {
-        className: 'flex items-baseline gap-2',
+        className: 'flex flex-wrap items-baseline gap-2',
         children: [
           jsx('div', {
             className: 'text-3xl font-semibold tabular-nums text-(--ui-accent)',
-            children: grand.known ? fmtUsd(grand.sum) : '—'
+            children: totals.known ? `${totals.unpricedTokens ? '≥' : ''}${fmtUsd(totals.cost)}` : '—'
           }),
           jsx('span', { className: 'text-xs text-(--ui-text-quaternary)', children: t('grandHint') })
         ]
       }),
-
-      grand.hitPct != null
+      jsx('div', {
+        className: 'text-xs text-(--ui-text-tertiary)',
+        children: led.since ? t('coverage', led.since, dayCount, KEEP_DAYS) : t('coverageNone')
+      }),
+      totals.hitPct != null
         ? jsxs('div', {
             className: 'flex flex-col gap-1.5',
             children: [
               jsxs('div', {
-                className: 'flex items-baseline justify-between text-xs',
+                className: 'flex items-baseline justify-between text-xs text-(--ui-text-tertiary)',
                 children: [
-                  jsxs('span', {
-                    className: 'text-(--ui-text-tertiary)',
-                    children: [t('hitRate'), ' ', jsx('span', {
-                      className: 'font-medium text-(--ui-accent)',
-                      children: `${Math.round(grand.hitPct)}%`
-                    })]
-                  }),
-                  jsxs('span', {
-                    className: 'text-(--ui-text-tertiary)',
-                    children: [t('savedTotal'), ' ', jsx('span', {
-                      className: 'font-medium text-(--ui-accent)',
-                      children: fmtUsd(grand.saved)
-                    })]
-                  })
+                  jsx('span', { children: `${t('hitRate')} ${totals.cacheEstimated ? '≈' : ''}${Math.round(totals.hitPct)}%` }),
+                  jsx('span', { children: `${t('savedTotal')} ${totals.cacheEstimated ? '≈' : ''}${fmtUsd(totals.saved)}` })
                 ]
               }),
-              jsx(CacheBar, { pct: grand.hitPct })
+              jsx(CacheBar, { pct: totals.hitPct })
             ]
           })
         : null,
-
-      models.length
+      ...rangeNotes(t, totals, storageError),
+      rows.length
         ? jsxs('table', {
             className: 'w-full text-xs',
             children: [
               jsx('thead', { children: jsx('tr', { children: head }) }),
-              jsx('tbody', { children: rows })
+              jsx('tbody', {
+                children: rows.map((r, i) =>
+                  jsx('tr', { className: 'border-b border-(--ui-stroke-secondary) align-top', children: cells(r) }, `${i}`)
+                )
+              })
             ]
           })
         : jsx('div', {
-            className:
-              'rounded-md border border-(--ui-stroke-secondary) p-6 text-center text-xs text-(--ui-text-quaternary)',
+            className: 'rounded-md border border-(--ui-stroke-secondary) p-6 text-center text-xs text-(--ui-text-quaternary)',
             children: t('noLedger')
           }),
-
-      jsx('p', {
-        className: 'text-[0.6875rem] leading-relaxed text-(--ui-text-quaternary)',
-        children: t('disclaimer')
-      })
-    ]
+      jsxs('div', {
+        className: 'flex flex-wrap items-center gap-2',
+        children: [
+          jsx(Button, { disabled: !dayCount, onClick: () => exportLedger('csv', t), size: 'sm', variant: 'outline', children: t('exportCsv') }),
+          jsx(Button, { disabled: !dayCount, onClick: () => exportLedger('json-copy', t), size: 'sm', variant: 'ghost', children: t('copyJson') })
+        ]
+      }),
+      jsx('p', { className: 'text-[0.6875rem] leading-relaxed text-(--ui-text-quaternary)', children: t('disclaimer') })
+    ].filter(Boolean)
   })
+}
+
+/* ------------------------------------------------------------------- i18n */
+
+const I18N = {
+  en: {
+    basisLegacy: 'pre-2.0 data · at current rates',
+    basisMixed: 'mixed rate sources',
+    cacheEstNote: '≈ Cached volume is derived from the gateway’s rounded hit rate; the cache split and savings are estimates.',
+    cacheRead: 'Cache read',
+    cacheTitle: 'Prompt cache',
+    cacheWrite: 'Cache write',
+    calls: 'Calls',
+    chipTip: (model, source, today, hit, saved) =>
+      `${model} — cost ${source}. Today ${today}. Cache hit ${hit}, saved ${saved} this session. Click for details.`,
+    chipTipIdle: 'Token & cost ledger — click for details',
+    context: 'Context',
+    copied: 'Ledger JSON copied to the clipboard.',
+    copyJson: 'Copy JSON',
+    cost: 'Cost',
+    coverage: (since, n, keep) => `Recorded since ${since} · ${n} day(s) with usage · daily totals kept ${keep} days`,
+    coverageNone: 'Nothing recorded yet.',
+    csvCopied: 'Download unavailable — CSV copied to the clipboard instead.',
+    disclaimer:
+      'Estimates. Costs are settled when usage is recorded, from the serving provider’s catalog $/Mtok (or the bundled models.dev table), not a billing API; subscription routes (Copilot, Nous credits) bill differently. The ledger is stored locally and only records usage seen while the plugin was running.',
+    empty: 'No live session usage — send a message.',
+    exportCsv: 'Export CSV',
+    exportFailed: 'Export failed.',
+    foreignNote: n => `⚠ ${n} tokens were priced with another provider’s rates — they may not match your route.`,
+    grandHint: 'estimated, settled at record time',
+    hitRate: 'Hit rate',
+    idle: 'tokens —',
+    input: 'Input',
+    legacyNote: n => `${n} tokens come from the pre-2.0 ledger, which stored no provider or price; they are estimated at current rates and may change.`,
+    loadingPrice: 'Loading pricing…',
+    modelCol: 'Model',
+    navLabel: 'Tokens & Cost',
+    noLedger: 'Nothing recorded in this range. Usage is folded in as turns complete.',
+    noPrice: 'n/a',
+    noPriceLong: 'No rate for this model in the provider catalog or the bundled models.dev table. Run scripts/gen-rates.py to refresh it.',
+    output: 'Output',
+    pageTitle: 'Token & Cost Ledger',
+    providerTip: slug => `Serving provider: ${slug}`,
+    providerUnknown: 'provider ?',
+    providerUnknownTip: 'The serving provider could not be confirmed — any price shown is borrowed.',
+    range_all: 'All recorded',
+    range_month: 'This month',
+    range_today: 'Today',
+    range_week: '7 days',
+    rates: 'Rates ($/Mtok)',
+    saved: 'Saved',
+    savedTotal: 'Saved by cache',
+    sessionTokens: 'This session',
+    src_bundled: 'estimated from models.dev rates',
+    src_foreign: slug => `⚠ rates borrowed from ${slug} — may not match your route`,
+    src_gateway: 'reported by gateway',
+    src_live: 'computed from catalog pricing',
+    src_none: 'pricing unavailable',
+    src_remembered: 'remembered catalog rates',
+    src_unconfirmed: slug => `⚠ provider unconfirmed — rates borrowed from ${slug}`,
+    storageError: msg => `⚠ The ledger could not be saved (${msg}). New usage is kept only until Hermes restarts.`,
+    subtotal: 'Subtotal',
+    today: 'today',
+    total: 'Total',
+    unpricedNote: n => `${n} tokens had no known rate and are not in the total (shown as ≥).`
+  },
+  zh: {
+    basisLegacy: '2.0 前旧数据 · 按现价估算',
+    basisMixed: '多种价格来源',
+    cacheEstNote: '≈ 缓存量由网关取整后的命中率推算，缓存拆分与节省额均为估算。',
+    cacheRead: '缓存读取',
+    cacheTitle: '提示词缓存',
+    cacheWrite: '缓存写入',
+    calls: '调用',
+    chipTip: (model, source, today, hit, saved) =>
+      `${model} — 费用${source}。今日 ${today}。缓存命中 ${hit}，本次会话节省 ${saved}。点击查看明细。`,
+    chipTipIdle: '令牌与花费账本 — 点击查看明细',
+    context: '上下文',
+    copied: '账本 JSON 已复制到剪贴板。',
+    copyJson: '复制 JSON',
+    cost: '花费',
+    coverage: (since, n, keep) => `自 ${since} 起记录 · 有用量的天数 ${n} · 按日汇总保留 ${keep} 天`,
+    coverageNone: '尚无记录。',
+    csvCopied: '无法下载，已改为把 CSV 复制到剪贴板。',
+    disclaimer:
+      '仅为估算。金额在记录用量时按实际承载线路的目录单价（或内置 models.dev 价格表）结算，并非账单接口；订阅制线路（Copilot、Nous 额度等）的实际计费不同。账本保存在本地，且只记录插件运行期间观察到的用量。',
+    empty: '当前会话暂无用量 — 先发一条消息。',
+    exportCsv: '导出 CSV',
+    exportFailed: '导出失败。',
+    foreignNote: n => `⚠ 有 ${n} 令牌借用了其他供应商的价格，可能与你的线路不符。`,
+    grandHint: '估算值，记录时结算',
+    hitRate: '命中率',
+    idle: '令牌 —',
+    input: '输入',
+    legacyNote: n => `有 ${n} 令牌来自 2.0 之前的账本，当时没有记录供应商和价格，现按当前单价估算，数值可能变化。`,
+    loadingPrice: '正在加载价格…',
+    modelCol: '模型',
+    navLabel: '令牌与花费',
+    noLedger: '该区间没有记录。每轮对话结束后会自动累加。',
+    noPrice: '无',
+    noPriceLong: '供应商目录与内置 models.dev 价格表中都没有该模型。可运行 scripts/gen-rates.py 刷新价格表。',
+    output: '输出',
+    pageTitle: '令牌与花费账本',
+    providerTip: slug => `实际承载线路：${slug}`,
+    providerUnknown: '供应商未知',
+    providerUnknownTip: '无法确认实际承载的供应商——显示的价格均为借用。',
+    range_all: '全部记录',
+    range_month: '本月',
+    range_today: '今日',
+    range_week: '近 7 天',
+    rates: '单价（$/百万令牌）',
+    saved: '已节省',
+    savedTotal: '缓存节省',
+    sessionTokens: '本次会话',
+    src_bundled: '按 models.dev 单价估算',
+    src_foreign: slug => `⚠ 借用了 ${slug} 的价格，可能与你的线路不符`,
+    src_gateway: '来自网关',
+    src_live: '按目录价格计算',
+    src_none: '价格不可用',
+    src_remembered: '历史目录价格',
+    src_unconfirmed: slug => `⚠ 供应商未确认，借用了 ${slug} 的价格`,
+    storageError: msg => `⚠ 账本保存失败（${msg}）。新用量只保留到 Hermes 重启前。`,
+    subtotal: '小计',
+    today: '今日',
+    total: '合计',
+    unpricedNote: n => `有 ${n} 令牌没有可用单价，未计入总额（显示为 ≥）。`
+  }
 }
 
 /* --------------------------------------------------------------- register */
@@ -993,124 +1343,33 @@ export default {
   description: 'Live token usage and model-aware cost, with a persistent per-day ledger.',
   register(ctx) {
     storage = ctx.storage
-    $ledger.set(loadLedger())
+    const { ledger, migrated } = readStoredLedger(ctx.storage)
+    $ledger.set(ledger)
+    if (migrated) saveLedger(ledger)
     $range.set(ctx.storage.get('range', 'today'))
     ctx.onDispose($range.listen(v => ctx.storage.set('range', v)))
-
-    ctx.i18n.register({
-      en: {
-        cacheRead: 'Cache read',
-        cacheWrite: 'Cache write',
-        cacheTitle: 'Prompt cache',
-        cachedRates: 'cached rates',
-        cachedVsFresh: 'Cached / fresh',
-        calls: 'Calls',
-        chipTip: (model, source, today, hit, saved) =>
-          `${model} — cost ${source}. Today ${today}. Cache hit ${hit}, saved ${saved} this session. Click for details.`,
-        chipTipIdle: 'Token & cost ledger — click for details',
-        context: 'Context',
-        cost: 'Cost',
-        disclaimer:
-          'Estimates. Costs come from the provider catalog’s $/Mtok rates, not a billing API; subscription routes (Copilot, Nous credits) may bill differently. The ledger is stored locally by this plugin and only records usage seen while the plugin was running.',
-        empty: 'No live session usage — send a message.',
-        grandHint: 'estimated, from catalog $/Mtok',
-        hitRate: 'Hit rate',
-        idle: 'tokens —',
-        input: 'Input',
-        loadingPrice: 'Loading pricing…',
-        modelCol: 'Model',
-        navLabel: 'Tokens & Cost',
-        noLedger: 'Nothing recorded yet. Usage is folded in as turns complete.',
-        noPrice: 'n/a',
-        noPriceLong: 'No rate for this model in the provider catalog or the bundled models.dev table. Run scripts/gen-rates.py to refresh it.',
-        ofWould: 'of', 
-        output: 'Output',
-        pageTitle: 'Token & Cost Ledger',
-        paneTitle: 'tokens & cost',
-        range_all: 'All time',
-        range_month: 'This month',
-        range_today: 'Today',
-        range_week: '7 days',
-        rates: 'Rates ($/Mtok)',
-        saved: 'Saved',
-        savedTotal: 'Saved by cache',
-        sessionTokens: 'This session',
-        providerTip: slug => `Active provider: ${slug} — the route serving this model`,
-        src_bundled: 'estimated from models.dev rates',
-        src_foreign: slug => `⚠ rates borrowed from ${slug} — may not match your route`,
-        src_gateway: 'reported by gateway',
-        src_none: 'pricing unavailable',
-        src_pricing: 'computed from catalog pricing',
-        subtotal: 'Subtotal',
-        today: 'today',
-        total: 'Total'
-      },
-      zh: {
-        cacheRead: '缓存读取',
-        cacheTitle: '提示词缓存',
-        cacheWrite: '缓存写入',
-        cachedRates: '历史价格',
-        cachedVsFresh: '缓存 / 新增',
-        calls: '调用',
-        chipTip: (model, source, today, hit, saved) =>
-          `${model} — 费用${source}。今日 ${today}。缓存命中 ${hit}，本次会话节省 ${saved}。点击查看明细。`,
-        chipTipIdle: '令牌与花费账本 — 点击查看明细',
-        context: '上下文',
-        cost: '花费',
-        disclaimer:
-          '仅为估算。金额按供应商目录的 $/百万令牌 单价计算，并非账单接口；订阅制路由（Copilot、Nous 额度等）的实际计费可能不同。账本由本插件保存在本地，且只记录插件运行期间观察到的用量。',
-        empty: '当前会话暂无用量 — 先发一条消息。',
-        grandHint: '按目录单价估算',
-        hitRate: '命中率',
-        idle: '令牌 —',
-        input: '输入',
-        loadingPrice: '正在加载价格…',
-        modelCol: '模型',
-        navLabel: '令牌与花费',
-        noLedger: '尚无记录。每轮对话结束后会自动累加。',
-        noPrice: '无',
-        noPriceLong: '供应商目录与内置 models.dev 价格表中都没有该模型。可运行 scripts/gen-rates.py 刷新价格表。',
-        ofWould: '原价',
-        output: '输出',
-        pageTitle: '令牌与花费账本',
-        paneTitle: '令牌与花费',
-        range_all: '全部',
-        range_month: '本月',
-        range_today: '今日',
-        range_week: '近 7 天',
-        rates: '单价（$/百万令牌）',
-        saved: '已节省',
-        savedTotal: '缓存节省',
-        sessionTokens: '本次会话',
-        providerTip: slug => `当前供应商：${slug} —— 实际承载该模型的线路`,
-        src_bundled: '按 models.dev 单价估算',
-        src_foreign: slug => `⚠ 借用了 ${slug} 的价格，可能与你的线路不符`,
-        src_gateway: '来自网关',
-        src_none: '价格不可用',
-        src_pricing: '按目录价格计算',
-        subtotal: '小计',
-        today: '今日',
-        total: '合计'
-      }
+    ctx.onDispose(() => {
+      storage = null
+      chains.clear()
     })
+
+    ctx.i18n.register(I18N)
 
     // --- ledger intake -------------------------------------------------
     // message.complete carries the authoritative final usage of a turn;
-    // session.usage is the mid-turn tick (cheap — commitUsage no-ops on a zero
-    // delta and only touches storage when something actually moved).
+    // session.usage is the mid-turn tick (applyUsage no-ops on a zero delta).
     const intake = event => {
       const usage = event && event.payload && event.payload.usage
-      if (usage && event.session_id) commitUsage(event.session_id, usage)
+      if (usage && event.session_id) enqueueUsage(event.session_id, usage)
     }
     ctx.onEvent('message.complete', intake)
     ctx.onEvent('session.usage', intake)
 
-    // Safety net: fold the focused session's live numbers on a slow timer so a
-    // turn that ends without a usable event still lands in the ledger.
+    // Safety net: fold the focused session's live numbers on a slow timer.
     ctx.setInterval(() => {
       const sid = host.state.focusedSessionId.get()
       const usage = host.state.focusedUsage.get()
-      if (sid && usage) commitUsage(sid, usage)
+      if (sid && usage) enqueueUsage(sid, usage)
     }, 30_000)
 
     // --- UI ------------------------------------------------------------
@@ -1121,14 +1380,7 @@ export default {
       data: { placement: 'right', width: '268px' },
       render: () => jsx(Meter, {})
     })
-
-    ctx.register({
-      id: 'chip',
-      area: 'statusBar.right',
-      order: 120,
-      render: () => jsx(Chip, {})
-    })
-
+    ctx.register({ id: 'chip', area: 'statusBar.right', order: 120, render: () => jsx(Chip, {}) })
     ctx.register({
       id: 'page',
       area: 'routes',
@@ -1136,11 +1388,30 @@ export default {
       data: { path: '/token-cost' },
       render: () => jsx(LedgerPage, {})
     })
-
     ctx.register({
       id: 'nav',
       area: 'sidebar.nav',
       data: { codicon: 'graph', label: 'Tokens & Cost', path: '/token-cost' }
     })
   }
+}
+
+/** Pure internals, exported for the node test-suite (the host only reads `default`). */
+export const __test = {
+  applyUsage,
+  bundledLookup,
+  csvCell,
+  daysAgoKey,
+  dayKey,
+  emptyLedger,
+  enqueueUsage,
+  findPricing,
+  ledgerCsv,
+  legacyPricer,
+  migrateV1,
+  readStoredLedger,
+  readUsage,
+  resolveRates,
+  summarize,
+  $ledger
 }
