@@ -66,7 +66,7 @@ today's running total. Hover for details.
 and a prompt-cache section (hit rate, cached vs fresh, dollars saved). Range
 totals live on the ledger page. Totals are kept per conversation, so reopening a
 conversation after quitting Hermes shows what it has cost so far (conversations
-from before v2.0 start counting from their next reply).
+from before v1.0.0 start counting from their next reply).
 
 <img src="image/session-pane-en.png" alt="Session pane: claude-opus-5 on github-copilot, $12.45, 15.22M total tokens, 97% cache hit rate, $65.73 saved, rates $5/$25/$0.5 per Mtok" width="340">
 
@@ -140,7 +140,7 @@ counted separately and the total is shown as `≥`.
 
 Ledgers from 1.x (`ledger.v1`, tokens only) are migrated to `ledger.v2` on first
 load; the old key is left untouched as a backup. Those rows are labelled
-"pre-2.0" and are still estimated at current rates, since no price was stored.
+"pre-1.0" and are still estimated at current rates, since no price was stored.
 
 The full page exports the ledger as CSV (one row per day × bucket, with the cost
 basis) or copies it as JSON. A failed storage write raises a warning instead of

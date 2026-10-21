@@ -34,7 +34,7 @@ import { jsx, jsxs } from 'react/jsx-runtime'
 
 const ID = 'token-cost-meter'
 const LEDGER_KEY = 'ledger.v2'
-/** Pre-2.0 ledger. Migrated on first load and left untouched as a backup. */
+/** Pre-1.0 ledger. Migrated on first load and left untouched as a backup. */
 const LEGACY_LEDGER_KEY = 'ledger.v1'
 const LEDGER_VERSION = 2
 /** Calendar days of per-day totals kept (by date, not by count). */
@@ -1366,7 +1366,7 @@ function LedgerPage() {
 
 const I18N = {
   en: {
-    basisLegacy: 'pre-2.0 data · at current rates',
+    basisLegacy: 'pre-1.0 data · at current rates',
     basisMixed: 'mixed rate sources',
     cacheEstNote: '≈ Cached volume is derived from the gateway’s rounded hit rate; the cache split and savings are estimates.',
     cacheRead: 'Cache read',
@@ -1397,7 +1397,7 @@ const I18N = {
     hitRate: 'Hit rate',
     idle: 'tokens —',
     input: 'Input',
-    legacyNote: n => `${n} tokens come from the pre-2.0 ledger, which stored no provider or price; they are estimated at current rates and may change.`,
+    legacyNote: n => `${n} tokens come from the pre-1.0 ledger, which stored no provider or price; they are estimated at current rates and may change.`,
     loadingPrice: 'Loading pricing…',
     modelCol: 'Model',
     navLabel: 'Tokens & Cost',
@@ -1431,7 +1431,7 @@ const I18N = {
     unpricedNote: n => `${n} tokens had no known rate and are not in the total (shown as ≥).`
   },
   zh: {
-    basisLegacy: '2.0 前旧数据 · 按现价估算',
+    basisLegacy: '1.0 前旧数据 · 按现价估算',
     basisMixed: '多种价格来源',
     cacheEstNote: '≈ 缓存量由网关取整后的命中率推算，缓存拆分与节省额均为估算。',
     cacheRead: '缓存读取',

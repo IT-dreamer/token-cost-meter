@@ -59,7 +59,7 @@ cp desktop/plugin.js ~/.hermes/desktop-plugins/token-cost-meter/
 **右侧面板** —— 本次会话的 token 明细、当前适用的单价、提示词缓存区块
 （命中率、缓存 vs 新增、节省金额）。按时间区间的汇总统一放在账本整页。
 用量按会话持久累计：退出 Hermes 后重新打开某个会话，仍能看到它此前的花费和命中率
-（v2.0 之前的会话从下一次回复开始累计）。
+（v1.0.0 之前的会话从下一次回复开始累计）。
 
 <img src="image/session-pane-zh.png" alt="会话面板：claude-opus-5 运行于 github-copilot，花费 $12.45，合计 15.22M 令牌，缓存命中率 97%，已节省 $65.73，单价 $5/$25/$0.5 每百万令牌" width="340">
 
@@ -120,7 +120,7 @@ Hermes 的 `CanonicalUsage` 定义了 `prompt = input + cache_read + cache_write
 没有可用单价的 token 单独计数，总额显示为 `≥`。
 
 1.x 的账本（`ledger.v1`，只有 token）首次加载时迁移到 `ledger.v2`，旧键原样保留作备份。
-这部分数据当时没有存价格，会标注为「2.0 前旧数据」并仍按现价估算。
+这部分数据当时没有存价格，会标注为「1.0 前旧数据」并仍按现价估算。
 
 账本整页可导出 CSV（每天 × 每桶一行，含计价依据）或复制 JSON。存储写入失败会给出警告，不再静默丢失。
 
