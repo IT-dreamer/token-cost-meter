@@ -866,6 +866,16 @@ async function exportLedger(kind, t) {
   }
 }
 
+/* ------------------------------------------------------------- side pane */
+
+/**
+ * Side-pane placement. Docked as a tab beside the core Files pane, so it shares
+ * that zone and the title bar's right-sidebar toggle shows/hides it like Files.
+ * The dock is only a first-adoption hint: if Files is absent, the host falls
+ * back to any right-placed zone, and a user's own drag is kept on later boots.
+ */
+const PANE_DATA = { placement: 'right', width: '268px', dock: { pane: 'files', pos: 'center' } }
+
 /* ---------------------------------------------------------------- routing */
 
 /** Last app route that wasn't the ledger page — where "close" goes back to. */
@@ -1553,7 +1563,7 @@ export default {
       id: 'pane',
       area: 'panes',
       title: 'tokens & cost',
-      data: { placement: 'right', width: '268px' },
+      data: PANE_DATA,
       render: () => jsx(Meter, {})
     })
     ctx.register({ id: 'chip', area: 'statusBar.right', order: 120, render: () => jsx(Chip, {}) })
@@ -1574,6 +1584,7 @@ export default {
 
 /** Pure internals, exported for the node test-suite (the host only reads `default`). */
 export const __test = {
+  PANE_DATA,
   applyUsage,
   bundledLookup,
   csvCell,
