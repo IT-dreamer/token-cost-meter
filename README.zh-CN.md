@@ -60,6 +60,7 @@ cp desktop/plugin.js ~/.hermes/desktop-plugins/token-cost-meter/
 （命中率、缓存 vs 新增、节省金额）。按时间区间的汇总统一放在账本整页。
 用量按会话持久累计：退出 Hermes 后重新打开某个会话，仍能看到它此前的花费和命中率
 （v1.0.0 之前的会话从下一次回复开始累计）。
+面板默认作为标签停靠在「文件」旁边，标题栏的右侧边栏开关可以一起展开或隐藏它。
 
 <img src="image/session-pane-zh.png" alt="会话面板：claude-opus-5 运行于 github-copilot，花费 $12.45，合计 15.22M 令牌，缓存命中率 97%，已节省 $65.73，单价 $5/$25/$0.5 每百万令牌" width="340">
 

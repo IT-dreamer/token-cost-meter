@@ -263,3 +263,8 @@ test('ledgers saved before this change load with an empty sessions map', () => {
   const { ledger } = T.readStoredLedger(store)
   assert.deepEqual(ledger.sessions, {})
 })
+
+test('side pane docks as a tab beside Files (shares the right-sidebar toggle)', () => {
+  assert.deepEqual(T.PANE_DATA.dock, { pane: 'files', pos: 'center' })
+  assert.equal(T.PANE_DATA.placement, 'right')
+})
