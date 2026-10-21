@@ -63,8 +63,10 @@ No entry in `config.yaml` is needed — this is a pure front-end plugin.
 today's running total. Hover for details.
 
 **Right-hand pane** — this session's token breakdown, the rates being applied,
-a prompt-cache section (hit rate, cached vs fresh, dollars saved), and
-subtotals for today / 7 days / this month.
+and a prompt-cache section (hit rate, cached vs fresh, dollars saved). Range
+totals live on the ledger page. Totals are kept per conversation, so reopening a
+conversation after quitting Hermes shows what it has cost so far (conversations
+from before v1.0.0 start counting from their next reply).
 
 <img src="image/session-pane-en.png" alt="Session pane: claude-opus-5 on github-copilot, $12.45, 15.22M total tokens, 97% cache hit rate, $65.73 saved, rates $5/$25/$0.5 per Mtok" width="340">
 
@@ -108,10 +110,17 @@ Savings is what the cached tokens *would* have cost at the full input rate,
 minus what they actually cost at the cache rate. Cache writes bill at the input
 rate either way, so they're neutral and excluded.
 
-The gateway only sends a rounded `cache_hit_pct`, not raw cache token counts, so
-the cached volume is recovered from `prompt - input` when the provider splits
-them, or derived from `prompt × hit%` when it doesn't. The derived path inherits
-the gateway's integer rounding — expect sub-percent drift.
+The gateway only sends a rounded `cache_hit_pct` (present only when cache reads
+> 0), not raw cache token counts. The split is recovered as:
+
+- raw `cache_read` / `cache_write` sent → exact
+- `prompt > input`, no hit% → the whole gap is cache **writes** (exact)
+- `prompt > input`, hit% present → reads ≈ `prompt × hit%` capped at the gap,
+  the rest are writes (estimated)
+- `prompt == input`, hit% present → input is split by hit% (estimated)
+
+Estimated figures are shown with a `≈` prefix and a note; savings derived from
+them are estimates too.
 
 ## The ledger
 
@@ -119,7 +128,23 @@ Gateway counters are cumulative per live agent and reset on restart, `/new` and
 `/reset`. The ledger diffs each reading against a per-`session::model` snapshot
 and accumulates only the delta; a counter that moves backwards is read as a
 fresh run and adopted whole. Totals are kept per calendar day (local time, not
-UTC) for 120 days.
+UTC) for 400 calendar days, bucketed by **profile + provider + model** — the same
+model on two routes is two rows.
+
+**Costs are settled when recorded.** Each delta is priced at that moment with the
+serving provider's rates (resolved with `model.options { session_id }`, so split
+tiles never borrow another session's provider) and the dollars are stored with
+their rate source (`gateway` / `live` / `remembered` / `bundled` / `foreign`).
+A later catalog change never rewrites history. Tokens with no known rate are
+counted separately and the total is shown as `≥`.
+
+Ledgers from 1.x (`ledger.v1`, tokens only) are migrated to `ledger.v2` on first
+load; the old key is left untouched as a backup. Those rows are labelled
+"pre-1.0" and are still estimated at current rates, since no price was stored.
+
+The full page exports the ledger as CSV (one row per day × bucket, with the cost
+basis) or copies it as JSON. A failed storage write raises a warning instead of
+being silently dropped.
 
 Intake comes from `message.complete` and `session.usage` events, with a 30s
 sweep of the focused session as a safety net.

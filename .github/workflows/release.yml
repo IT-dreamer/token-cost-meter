@@ -1,0 +1,52 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Check tag matches plugin.yaml version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          ver="$(sed -n 's/^version: *"\{0,1\}\([^"]*\)"\{0,1\}$/\1/p' plugin.yaml)"
+          echo "tag=$tag plugin.yaml=$ver"
+          [ "$tag" = "$ver" ] || { echo "::error::tag v$tag != plugin.yaml $ver"; exit 1; }
+
+      - name: Syntax check & tests
+        run: |
+          node --check desktop/plugin.js
+          node --test test/*.test.mjs
+
+      - name: Build artifacts
+        run: |
+          name="token-cost-meter-${GITHUB_REF_NAME}"
+          mkdir -p "dist/token-cost-meter"
+          cp -r plugin.yaml desktop LICENSE README.md README.zh-CN.md image "dist/token-cost-meter/"
+          (cd dist && zip -qr "${name}.zip" token-cost-meter)
+          cp desktop/plugin.js "dist/plugin.js"
+          (cd dist && sha256sum "${name}.zip" plugin.js > SHA256SUMS.txt)
+          ls -l dist
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: token-cost-meter ${{ github.ref_name }}
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          make_latest: ${{ !contains(github.ref_name, '-') }}
+          files: |
+            dist/token-cost-meter-${{ github.ref_name }}.zip
+            dist/plugin.js
+            dist/SHA256SUMS.txt
