@@ -20,6 +20,7 @@ import {
   Badge,
   Button,
   cn,
+  Codicon,
   host,
   queryClient,
   SegmentedControl,
@@ -28,6 +29,7 @@ import {
   useQuery,
   useValue
 } from '@hermes/plugin-sdk'
+import { useEffect } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
 const ID = 'token-cost-meter'
@@ -42,6 +44,7 @@ const SNAPSHOT_TTL_MS = 30 * 86_400_000
 const MAX_SNAPSHOTS = 2000
 const CATALOG_STALE_MS = 10 * 60 * 1000
 const M = 1_000_000
+const LEDGER_ROUTE = '/token-cost'
 
 /* ------------------------------------------------------------------ utils */
 
@@ -808,6 +811,41 @@ async function exportLedger(kind, t) {
   }
 }
 
+/* ---------------------------------------------------------------- routing */
+
+/** Last app route that wasn't the ledger page — where "close" goes back to. */
+let returnTo = null
+
+function currentRoute() {
+  return (typeof window !== 'undefined' && window.location.hash.slice(1)) || '/'
+}
+
+function isLedgerRoute(route) {
+  return route === LEDGER_ROUTE || route.startsWith(`${LEDGER_ROUTE}?`) || route.startsWith(`${LEDGER_ROUTE}/`)
+}
+
+function rememberRoute() {
+  const route = currentRoute()
+  if (!isLedgerRoute(route)) returnTo = route
+}
+
+/** Entering the page from anywhere: the route we LEFT is the one to return to. */
+function onHashChange(e) {
+  const old = e && typeof e.oldURL === 'string' && e.oldURL.includes('#') ? e.oldURL.split('#').slice(1).join('#') || '/' : null
+  if (old && !isLedgerRoute(old) && isLedgerRoute(currentRoute())) returnTo = old
+  else rememberRoute()
+}
+
+function openLedger() {
+  rememberRoute()
+  host.navigate(LEDGER_ROUTE)
+}
+
+function closeLedger() {
+  const target = returnTo && !isLedgerRoute(returnTo) ? returnTo : '/'
+  host.navigate(target)
+}
+
 /* ------------------------------------------------------------------ hooks */
 
 /** The focused session's live numbers, priced with ITS provider's catalog. */
@@ -869,7 +907,7 @@ function Chip() {
   const t = usePluginI18n(ID)
   const live = useLive()
   const today = useSummary('today').totals
-  const open = () => host.navigate('/token-cost')
+  const open = openLedger
   const todayText = today.known ? `${t('today')} ${fmtUsd(today.cost)}${today.unpricedTokens ? '+' : ''}` : null
 
   if (!live.usage) {
@@ -1084,6 +1122,19 @@ function LedgerPage() {
   const { rows, totals } = useSummary(range)
   const dayCount = Object.keys(led.days).length
 
+  // Esc closes the page, unless the user is typing somewhere.
+  useEffect(() => {
+    const onKey = e => {
+      if (e.key !== 'Escape' || e.defaultPrevented) return
+      const el = e.target
+      if (el && (el.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName))) return
+      if (document.querySelector('[role="dialog"]')) return
+      closeLedger()
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [])
+
   const cells = r => {
     const pct = hitPctOf(r)
     const approx = r.cacheEstimated ? '≈' : ''
@@ -1132,10 +1183,25 @@ function LedgerPage() {
         className: 'flex flex-wrap items-center justify-between gap-3',
         children: [
           jsx('h1', { className: 'text-base font-semibold', children: t('pageTitle') }),
-          jsx(SegmentedControl, {
-            onChange: v => $range.set(v),
-            options: ['today', 'week', 'month', 'all'].map(id => ({ id, label: t(`range_${id}`) })),
-            value: range
+          jsxs('div', {
+            className: 'flex items-center gap-2',
+            children: [
+              jsx(SegmentedControl, {
+                onChange: v => $range.set(v),
+                options: ['today', 'week', 'month', 'all'].map(id => ({ id, label: t(`range_${id}`) })),
+                value: range
+              }),
+              jsx(Tip, {
+                label: t('closeTip'),
+                children: jsx(Button, {
+                  'aria-label': t('close'),
+                  onClick: closeLedger,
+                  size: 'icon-sm',
+                  variant: 'ghost',
+                  children: jsx(Codicon, { name: 'close' })
+                })
+              })
+            ]
           })
         ]
       }),
@@ -1207,6 +1273,8 @@ const I18N = {
     cacheRead: 'Cache read',
     cacheTitle: 'Prompt cache',
     cacheWrite: 'Cache write',
+    close: 'Close',
+    closeTip: 'Close (Esc)',
     calls: 'Calls',
     chipTip: (model, source, today, hit, saved) =>
       `${model} — cost ${source}. Today ${today}. Cache hit ${hit}, saved ${saved} this session. Click for details.`,
@@ -1267,6 +1335,8 @@ const I18N = {
     cacheRead: '缓存读取',
     cacheTitle: '提示词缓存',
     cacheWrite: '缓存写入',
+    close: '关闭',
+    closeTip: '关闭（Esc）',
     calls: '调用',
     chipTip: (model, source, today, hit, saved) =>
       `${model} — 费用${source}。今日 ${today}。缓存命中 ${hit}，本次会话节省 ${saved}。点击查看明细。`,
@@ -1344,6 +1414,12 @@ export default {
 
     ctx.i18n.register(I18N)
 
+    // Remember where the user came from however they reach the page
+    // (status chip, sidebar nav, palette), so "close" returns there.
+    rememberRoute()
+    window.addEventListener('hashchange', onHashChange)
+    ctx.onDispose(() => window.removeEventListener('hashchange', onHashChange))
+
     // --- ledger intake -------------------------------------------------
     // message.complete carries the authoritative final usage of a turn;
     // session.usage is the mid-turn tick (applyUsage no-ops on a zero delta).
@@ -1374,13 +1450,13 @@ export default {
       id: 'page',
       area: 'routes',
       title: 'Token & Cost Ledger',
-      data: { path: '/token-cost' },
+      data: { path: LEDGER_ROUTE },
       render: () => jsx(LedgerPage, {})
     })
     ctx.register({
       id: 'nav',
       area: 'sidebar.nav',
-      data: { codicon: 'graph', label: 'Tokens & Cost', path: '/token-cost' }
+      data: { codicon: 'graph', label: 'Tokens & Cost', path: LEDGER_ROUTE }
     })
   }
 }
@@ -1395,7 +1471,11 @@ export const __test = {
   emptyLedger,
   enqueueUsage,
   findPricing,
+  closeLedger,
+  isLedgerRoute,
   ledgerCsv,
+  onHashChange,
+  openLedger,
   legacyPricer,
   migrateV1,
   readStoredLedger,

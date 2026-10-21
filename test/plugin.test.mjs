@@ -12,16 +12,20 @@ const src = readFileSync(new URL('../desktop/plugin.js', import.meta.url), 'utf8
 const stub = `
 const atom = v => { let s = v; return { get: () => s, set: n => { s = n }, listen: () => () => {} } }
 const noop = () => null
-const Badge = noop, Button = noop, SegmentedControl = noop, Tip = noop
+const Badge = noop, Button = noop, Codicon = noop, SegmentedControl = noop, Tip = noop
 const cn = (...a) => a.filter(Boolean).join(' ')
-const host = { state: {}, notify() {}, navigate() {}, request: async () => null }
+const host = { state: {}, notify() {}, navigate(p) { globalThis.__nav.push(p); globalThis.window.location.hash = '#' + p }, request: async () => null }
+const useEffect = noop
 const queryClient = { fetchQuery: async q => q.queryFn(), getQueryData: () => null }
 const usePluginI18n = noop, useQuery = noop, useValue = noop
 const jsx = noop, jsxs = noop
 `
 const body = src
   .replace(/import \{[^}]*\} from '@hermes\/plugin-sdk'\n/, stub)
+  .replace(/import \{ useEffect \} from 'react'\n/, '')
   .replace(/import \{ jsx, jsxs \} from 'react\/jsx-runtime'\n/, '')
+globalThis.__nav = []
+globalThis.window = { location: { hash: '' } }
 const dir = mkdtempSync(join(process.env.TMPDIR || tmpdir(), 'tcm-'))
 const file = join(dir, 'plugin.mjs')
 writeFileSync(file, body)
@@ -203,4 +207,28 @@ test('CSV export: header, settled cost, formula injection neutralised', () => {
 test('daysAgoKey is DST-safe local calendar math', () => {
   assert.equal(T.daysAgoKey(1, new Date(2026, 2, 9, 0, 30).getTime()), '2026-03-08')
   assert.equal(T.daysAgoKey(0, NOW), T.dayKey(NOW))
+})
+
+test('close returns to the route the ledger was opened from', () => {
+  window.location.hash = '#/session/abc'
+  T.openLedger()
+  assert.equal(window.location.hash, '#/token-cost')
+  T.closeLedger()
+  assert.equal(__nav.at(-1), '/session/abc')
+})
+
+test('close works when the page was reached via sidebar nav (hashchange)', () => {
+  window.location.hash = '#/token-cost'
+  T.onHashChange({ oldURL: 'app://x/index.html#/settings?tab=a' })
+  T.closeLedger()
+  assert.equal(__nav.at(-1), '/settings?tab=a')
+})
+
+test('close never loops back onto the ledger; falls back to new chat', () => {
+  assert.equal(T.isLedgerRoute('/token-cost?x=1'), true)
+  assert.equal(T.isLedgerRoute('/token-costs'), false)
+  window.location.hash = '#/token-cost'
+  T.onHashChange({ oldURL: 'app://x/#/token-cost' })
+  T.closeLedger()
+  assert.notEqual(__nav.at(-1), '/token-cost')
 })
