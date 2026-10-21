@@ -1,4 +1,4 @@
 name: token-cost-meter
-version: "1.0.0"
+version: "2.0.0"
 description: "Live token usage, model-aware USD cost and prompt-cache savings in the Hermes Desktop status bar, plus a persistent per-day ledger that survives restarts. Falls back to a bundled models.dev rate table so subscription routes (GitHub Copilot and friends), which report no pricing, still show a cost estimate."
 author: "AFei"
