@@ -42,6 +42,8 @@ const KEEP_DAYS = 400
 /** Per-session counter snapshots older than this are dropped. */
 const SNAPSHOT_TTL_MS = 30 * 86_400_000
 const MAX_SNAPSHOTS = 2000
+/** Per-conversation totals kept for the side pane (newest by lastAt win). */
+const MAX_SESSIONS = 1000
 const CATALOG_STALE_MS = 10 * 60 * 1000
 const M = 1_000_000
 const LEDGER_ROUTE = '/token-cost'
@@ -358,10 +360,12 @@ function hitPctOf(b) {
  *   snapshots[sid::model]       = last cumulative reading (+ costUsd, at)
  *   rates[provider|model]       = last live catalog rates for that route
  *   legacyRates[model]          = v1's provider-less remembered rates
+ *   sessions[storedSessionId]   = Bucket + firstAt/lastAt — a conversation's running
+ *                                 total that survives app/gateway restarts
  *   since                       = first day this ledger has data for
  */
 function emptyLedger() {
-  return { v: LEDGER_VERSION, days: {}, legacyRates: {}, rates: {}, since: null, snapshots: {} }
+  return { v: LEDGER_VERSION, days: {}, legacyRates: {}, rates: {}, sessions: {}, since: null, snapshots: {} }
 }
 
 function bucketKey(profile, provider, model, legacy) {
@@ -427,6 +431,7 @@ function normalizeV2(raw) {
     days: isObj(raw.days) ? raw.days : {},
     legacyRates: isObj(raw.legacyRates) ? raw.legacyRates : {},
     rates: isObj(raw.rates) ? raw.rates : {},
+    sessions: isObj(raw.sessions) ? raw.sessions : {},
     since: typeof raw.since === 'string' ? raw.since : null,
     snapshots: isObj(raw.snapshots) ? raw.snapshots : {}
   }
@@ -449,6 +454,34 @@ function pruneDays(days, now) {
   return out
 }
 
+function pruneSessions(sessions, now) {
+  const cutoff = now - KEEP_DAYS * 86_400_000
+  const fresh = Object.entries(sessions).filter(([, s]) => isObj(s) && num(s.lastAt) >= cutoff)
+  if (fresh.length > MAX_SESSIONS) fresh.sort((a, b) => num(b[1].lastAt) - num(a[1].lastAt)).length = MAX_SESSIONS
+  return Object.fromEntries(fresh)
+}
+
+/** Add one priced delta to a bucket (copy-on-write). */
+function addDelta(prevBucket, init, { costDelta, cur, delta, deltaTokens, resolved, source }) {
+  const b = prevBucket ? { ...prevBucket, sources: { ...prevBucket.sources } } : newBucket(init)
+  b.input += delta.input
+  b.output += delta.output
+  b.cacheRead += delta.cacheRead
+  b.cacheWrite += delta.cacheWrite
+  b.calls += delta.calls
+  if (cur.cacheEstimated && delta.cacheRead) b.cacheEstimated = true
+  if (costDelta != null) {
+    b.cost += costDelta
+    b.pricedTokens += deltaTokens
+    b.sources[source] = num(b.sources[source]) + deltaTokens
+    if (source === 'foreign' && resolved.foreignSlug) b.foreignSlug = resolved.foreignSlug
+  } else {
+    b.unpricedTokens += deltaTokens
+  }
+  if (resolved.rates) b.saved += cacheSavings(delta.cacheRead, resolved.rates)
+  return b
+}
+
 function pruneSnapshots(snaps, now) {
   const fresh = Object.entries(snaps).filter(([, s]) => isObj(s) && now - num(s.at) <= SNAPSHOT_TTL_MS)
   if (fresh.length > MAX_SNAPSHOTS) fresh.sort((a, b) => num(b[1].at) - num(a[1].at)).length = MAX_SNAPSHOTS
@@ -466,7 +499,7 @@ function pruneSnapshots(snaps, now) {
  *
  * Returns the same object when nothing changed.
  */
-function applyUsage(led, { now = Date.now(), payload = null, profile = '', provider = '', sessionId, usage }) {
+function applyUsage(led, { now = Date.now(), payload = null, profile = '', provider = '', sessionId, storedId = '', usage }) {
   if (!sessionId || !usage) return led
   const model = String(usage.model || '').trim()
   if (!model) return led
@@ -515,22 +548,8 @@ function applyUsage(led, { now = Date.now(), payload = null, profile = '', provi
   const key = bucketKey(profile, provider, model, false)
   const days = { ...led.days }
   const forDay = { ...(days[day] || {}) }
-  const b = forDay[key] ? { ...forDay[key], sources: { ...forDay[key].sources } } : newBucket({ model, profile, provider })
-  b.input += delta.input
-  b.output += delta.output
-  b.cacheRead += delta.cacheRead
-  b.cacheWrite += delta.cacheWrite
-  b.calls += delta.calls
-  if (cur.cacheEstimated && delta.cacheRead) b.cacheEstimated = true
-  if (costDelta != null) {
-    b.cost += costDelta
-    b.pricedTokens += deltaTokens
-    b.sources[source] = num(b.sources[source]) + deltaTokens
-    if (source === 'foreign' && resolved.foreignSlug) b.foreignSlug = resolved.foreignSlug
-  } else {
-    b.unpricedTokens += deltaTokens
-  }
-  if (resolved.rates) b.saved += cacheSavings(delta.cacheRead, resolved.rates)
+  const change = { costDelta, cur, delta, deltaTokens, resolved, source }
+  const b = addDelta(forDay[key], { model, profile, provider }, change)
   forDay[key] = b
   days[day] = forDay
 
@@ -540,7 +559,20 @@ function applyUsage(led, { now = Date.now(), payload = null, profile = '', provi
   const pruned = pruneDays(days, now)
   const since = led.since && led.since <= day ? led.since : Object.keys(pruned).sort()[0] || day
 
-  return { ...led, days: pruned, rates, since, snapshots }
+  let sessions = led.sessions || {}
+  if (storedId) {
+    const prevS = sessions[storedId]
+    const s = addDelta(prevS, { model, profile, provider }, change)
+    // The pane shows the conversation's latest route.
+    s.model = model
+    s.profile = profile
+    s.provider = provider
+    s.firstAt = prevS ? num(prevS.firstAt) || now : now
+    s.lastAt = now
+    sessions = pruneSessions({ ...sessions, [storedId]: s }, now)
+  }
+
+  return { ...led, days: pruned, rates, sessions, since, snapshots }
 }
 
 /** Rates for a legacy (v1, provider-less) bucket: its remembered rates, else a clearly borrowed price. */
@@ -737,6 +769,28 @@ function profileFor(sessionId) {
   }
 }
 
+/**
+ * Live (runtime) session id -> durable stored session id. Runtime ids change
+ * every time a conversation is resumed; stored ids don't, so per-conversation
+ * totals are keyed by the latter. Learned whenever a session is focused.
+ */
+const storedIds = new Map()
+
+function learnStoredId() {
+  try {
+    const sid = host.state.focusedSessionId.get()
+    const stored = host.state.focusedStoredSessionId.get()
+    if (sid && stored) storedIds.set(sid, stored)
+  } catch {
+    /* older hosts: no stored id, per-conversation totals just stay empty */
+  }
+}
+
+function storedIdFor(sessionId) {
+  learnStoredId()
+  return storedIds.get(sessionId) || ''
+}
+
 /** Per-session serial queue: readings for one session commit in arrival order. */
 const chains = new Map()
 
@@ -744,13 +798,14 @@ function enqueueUsage(sessionId, usage) {
   if (!sessionId || !usage) return null
   const snapshot = { ...usage }
   const profile = profileFor(sessionId)
+  const storedId = storedIdFor(sessionId)
   const prev = chains.get(sessionId) || Promise.resolve()
   const run = prev
     .then(async () => {
       const payload = await getCatalog(sessionId)
       const provider = payload && typeof payload.provider === 'string' ? payload.provider : ''
       const led = $ledger.get()
-      const next = applyUsage(led, { payload, profile, provider, sessionId, usage: snapshot })
+      const next = applyUsage(led, { payload, profile, provider, sessionId, storedId, usage: snapshot })
       if (next !== led) saveLedger(next)
     })
     .catch(err => console.warn(`[${ID}] usage not recorded:`, err))
@@ -848,9 +903,12 @@ function closeLedger() {
 
 /* ------------------------------------------------------------------ hooks */
 
+const $none = atom(null)
+
 /** The focused session's live numbers, priced with ITS provider's catalog. */
 function useLive() {
   const sessionId = useValue(host.state.focusedSessionId)
+  const storedId = useValue(host.state.focusedStoredSessionId || $none)
   const rawUsage = useValue(host.state.focusedUsage)
   const stateModel = useValue(host.state.model)
   const led = useValue($ledger)
@@ -872,6 +930,36 @@ function useLive() {
     usage && typeof usage.cost_usd === 'number' && usage.cost_usd > 0 ? usage.cost_usd : null
 
   const gatewayHit = usage && typeof usage.cache_hit_pct === 'number' ? usage.cache_hit_pct : null
+
+  // The conversation's recorded total (all runs, survives restarts). It is
+  // written on every usage tick, so while a run is live it already includes
+  // it; prefer it whenever it exists and isn't behind the live counters.
+  const hist = storedId && led.sessions ? led.sessions[storedId] : null
+  if (hist && tokensOf(hist) && (!bucket || tokensOf(hist) >= tokensOf(bucket))) {
+    const kinds = Object.keys(hist.sources || {}).filter(k => num(hist.sources[k]))
+    const histSource = !hist.pricedTokens ? 'none' : kinds.length === 1 ? kinds[0] : 'mixed'
+    const histModel = hist.model || model
+    const histRates = usage ? resolved : resolveRates({ model: histModel, payload, provider: hist.provider || provider, remembered: led.rates })
+    return {
+      bucket: hist,
+      cacheHitPct: hitPctOf(hist),
+      cost: hist.pricedTokens ? hist.cost : null,
+      costSource: histSource,
+      foreignSlug: hist.foreignSlug || resolved.foreignSlug,
+      fromHistory: !usage,
+      model: (usage && usage.model) || histModel,
+      partial: num(hist.unpricedTokens) > 0 && num(hist.pricedTokens) > 0,
+      pricingError: error ? String(error.message || error) : null,
+      pricingLoading: isLoading,
+      provider: provider || hist.provider || null,
+      providerUnknown: !(provider || hist.provider),
+      rates: histRates.rates,
+      saved: hist.saved,
+      sinceAt: hist.firstAt,
+      usage
+    }
+  }
+
   return {
     bucket,
     cacheHitPct: gatewayHit != null ? gatewayHit : bucket ? hitPctOf(bucket) : null,
@@ -898,6 +986,13 @@ function useSummary(range) {
 
 /* --------------------------------------------------------------------- UI */
 
+function fmtDate(ms) {
+  const d = new Date(num(ms))
+  if (Number.isNaN(d.getTime())) return '—'
+  const p2 = n => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${p2(d.getMonth() + 1)}-${p2(d.getDate())} ${p2(d.getHours())}:${p2(d.getMinutes())}`
+}
+
 function sourceLabel(t, origin, foreignSlug, providerUnknown) {
   if (origin === 'foreign') return providerUnknown ? t('src_unconfirmed', foreignSlug || '?') : t('src_foreign', foreignSlug || '?')
   return t(`src_${origin}`)
@@ -910,7 +1005,7 @@ function Chip() {
   const open = openLedger
   const todayText = today.known ? `${t('today')} ${fmtUsd(today.cost)}${today.unpricedTokens ? '+' : ''}` : null
 
-  if (!live.usage) {
+  if (!live.bucket) {
     return jsx(Tip, {
       label: t('chipTipIdle'),
       children: jsx('button', {
@@ -943,7 +1038,7 @@ function Chip() {
       onClick: open,
       type: 'button',
       children: [
-        jsx('span', { children: `${fmtTokens(live.usage.input)}↑ ${fmtTokens(live.usage.output)}↓` }),
+        jsx('span', { children: `${fmtTokens(live.bucket.input)}↑ ${fmtTokens(live.bucket.output)}↓` }),
         jsx('span', { className: 'text-(--ui-text-quaternary)', children: '·' }),
         jsx('span', {
           className: live.cost == null ? 'text-(--ui-text-quaternary)' : warn ? 'text-(--ui-warning)' : 'text-(--ui-accent)',
@@ -1015,7 +1110,7 @@ function Meter() {
   const storageError = useValue($storageError)
   const sections = []
 
-  if (live.usage) {
+  if (live.bucket) {
     const u = live.usage
     const b = live.bucket
     const approx = b.cacheEstimated ? '≈' : ''
@@ -1056,9 +1151,9 @@ function Meter() {
                 jsx(Row, { label: t('output'), value: fmtTokens(b.output) }, 'o'),
                 b.cacheRead ? jsx(Row, { dim: true, label: t('cacheRead'), value: `${approx}${fmtTokens(b.cacheRead)}` }, 'cr') : null,
                 b.cacheWrite ? jsx(Row, { dim: true, label: t('cacheWrite'), value: `${approx}${fmtTokens(b.cacheWrite)}` }, 'cw') : null,
-                jsx(Row, { label: t('total'), value: fmtTokens(u.total) }, 'tt'),
-                jsx(Row, { dim: true, label: t('calls'), value: String(u.calls ?? 0) }, 'c'),
-                typeof u.context_percent === 'number'
+                jsx(Row, { label: t('total'), value: fmtTokens(tokensOf(b)) }, 'tt'),
+                jsx(Row, { dim: true, label: t('calls'), value: String(b.calls ?? 0) }, 'c'),
+                u && typeof u.context_percent === 'number'
                   ? jsx(Row, {
                       dim: true,
                       label: t('context'),
@@ -1067,6 +1162,10 @@ function Meter() {
                   : null
               ].filter(Boolean)
             }),
+            live.sinceAt
+              ? jsx(Note, { children: t(live.fromHistory ? 'historyNote' : 'cumulativeNote', fmtDate(live.sinceAt)) }, 'hist')
+              : null,
+            live.partial ? jsx(Note, { warn: true, children: t('unpricedNote', fmtTokens(b.unpricedTokens)) }, 'up') : null,
             live.cacheHitPct != null
               ? jsx(Section, {
                   title: t('cacheTitle'),
@@ -1288,7 +1387,9 @@ const I18N = {
     csvCopied: 'Download unavailable — CSV copied to the clipboard instead.',
     disclaimer:
       'Estimates. Costs are settled when usage is recorded, from the serving provider’s catalog $/Mtok (or the bundled models.dev table), not a billing API; subscription routes (Copilot, Nous credits) bill differently. The ledger is stored locally and only records usage seen while the plugin was running.',
-    empty: 'No live session usage — send a message.',
+    empty: 'No usage recorded for this conversation yet — it appears after the next reply.',
+    historyNote: d => `Conversation total since ${d}, across restarts. New replies keep adding to it.`,
+    cumulativeNote: d => `Conversation total since ${d}, including earlier runs.`,
     exportCsv: 'Export CSV',
     exportFailed: 'Export failed.',
     foreignNote: n => `⚠ ${n} tokens were priced with another provider’s rates — they may not match your route.`,
@@ -1321,6 +1422,7 @@ const I18N = {
     src_gateway: 'reported by gateway',
     src_live: 'computed from catalog pricing',
     src_none: 'pricing unavailable',
+    src_mixed: 'mixed pricing sources',
     src_remembered: 'remembered catalog rates',
     src_unconfirmed: slug => `⚠ provider unconfirmed — rates borrowed from ${slug}`,
     storageError: msg => `⚠ The ledger could not be saved (${msg}). New usage is kept only until Hermes restarts.`,
@@ -1350,7 +1452,9 @@ const I18N = {
     csvCopied: '无法下载，已改为把 CSV 复制到剪贴板。',
     disclaimer:
       '仅为估算。金额在记录用量时按实际承载线路的目录单价（或内置 models.dev 价格表）结算，并非账单接口；订阅制线路（Copilot、Nous 额度等）的实际计费不同。账本保存在本地，且只记录插件运行期间观察到的用量。',
-    empty: '当前会话暂无用量 — 先发一条消息。',
+    empty: '这个会话还没有记录到用量，下一次回复后会显示。',
+    historyNote: d => `自 ${d} 起的会话累计（重启后保留），继续对话会接着累加。`,
+    cumulativeNote: d => `自 ${d} 起的会话累计，包含之前的运行。`,
     exportCsv: '导出 CSV',
     exportFailed: '导出失败。',
     foreignNote: n => `⚠ 有 ${n} 令牌借用了其他供应商的价格，可能与你的线路不符。`,
@@ -1383,6 +1487,7 @@ const I18N = {
     src_gateway: '来自网关',
     src_live: '按目录价格计算',
     src_none: '价格不可用',
+    src_mixed: '多种计价来源',
     src_remembered: '历史目录价格',
     src_unconfirmed: slug => `⚠ 供应商未确认，借用了 ${slug} 的价格`,
     storageError: msg => `⚠ 账本保存失败（${msg}）。新用量只保留到 Hermes 重启前。`,
@@ -1410,6 +1515,7 @@ export default {
       storage = null
       osApi = null
       chains.clear()
+      storedIds.clear()
     })
 
     ctx.i18n.register(I18N)
@@ -1429,6 +1535,11 @@ export default {
     }
     ctx.onEvent('message.complete', intake)
     ctx.onEvent('session.usage', intake)
+    learnStoredId()
+    if (host.state.focusedStoredSessionId) {
+      ctx.onDispose(host.state.focusedSessionId.listen(learnStoredId))
+      ctx.onDispose(host.state.focusedStoredSessionId.listen(learnStoredId))
+    }
 
     // Safety net: fold the focused session's live numbers on a slow timer.
     ctx.setInterval(() => {

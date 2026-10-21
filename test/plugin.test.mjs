@@ -14,7 +14,7 @@ const atom = v => { let s = v; return { get: () => s, set: n => { s = n }, liste
 const noop = () => null
 const Badge = noop, Button = noop, Codicon = noop, SegmentedControl = noop, Tip = noop
 const cn = (...a) => a.filter(Boolean).join(' ')
-const host = { state: {}, notify() {}, navigate(p) { globalThis.__nav.push(p); globalThis.window.location.hash = '#' + p }, request: async () => null }
+const host = { state: { focusedSessionId: { get: () => null, listen: () => () => {} }, focusedStoredSessionId: { get: () => null, listen: () => () => {} }, profile: { get: () => '' }, focusedSessionProfile: { get: () => '' } }, notify() {}, navigate(p) { globalThis.__nav.push(p); globalThis.window.location.hash = '#' + p }, request: async () => null }
 const useEffect = noop
 const queryClient = { fetchQuery: async q => q.queryFn(), getQueryData: () => null }
 const usePluginI18n = noop, useQuery = noop, useValue = noop
@@ -231,4 +231,35 @@ test('close never loops back onto the ledger; falls back to new chat', () => {
   T.onHashChange({ oldURL: 'app://x/#/token-cost' })
   T.closeLedger()
   assert.notEqual(__nav.at(-1), '/token-cost')
+})
+
+test('per-conversation totals survive a restart (new runtime id, counters reset)', () => {
+  let led = T.emptyLedger()
+  const u = (input, output, cacheRead, calls) => ({ model: 'gpt-4o', input, output, cache_read: cacheRead, calls, total: input + output + cacheRead })
+  led = T.applyUsage(led, { now: 1e12, sessionId: 'run-1', storedId: 'conv-A', usage: u(1000, 200, 500, 2) })
+  led = T.applyUsage(led, { now: 1e12 + 1, sessionId: 'run-1', storedId: 'conv-A', usage: u(1500, 300, 900, 3) })
+  // app restarted, conversation resumed under a fresh runtime id, counters from 0
+  led = T.applyUsage(led, { now: 1e12 + 2, sessionId: 'run-2', storedId: 'conv-A', usage: u(100, 50, 400, 1) })
+  const s = led.sessions['conv-A']
+  assert.equal(s.input, 1600)
+  assert.equal(s.output, 350)
+  assert.equal(s.cacheRead, 1300)
+  assert.equal(s.calls, 4)
+  assert.equal(s.firstAt, 1e12)
+  assert.equal(s.lastAt, 1e12 + 2)
+  // per-day ledger agrees with the conversation total
+  const day = Object.values(Object.values(led.days)[0])[0]
+  assert.equal(day.input, s.input)
+  assert.ok(Math.abs(day.cost - s.cost) < 1e-12)
+})
+
+test('no stored id -> day ledger only, no session entry', () => {
+  const led = T.applyUsage(T.emptyLedger(), { sessionId: 'r', usage: { model: 'gpt-4o', input: 10, output: 5, calls: 1 } })
+  assert.deepEqual(led.sessions, {})
+})
+
+test('ledgers saved before this change load with an empty sessions map', () => {
+  const store = { get: k => (k === 'ledger.v2' ? { v: 2, days: {}, rates: {}, snapshots: {} } : null) }
+  const { ledger } = T.readStoredLedger(store)
+  assert.deepEqual(ledger.sessions, {})
 })

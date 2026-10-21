@@ -64,7 +64,9 @@ today's running total. Hover for details.
 
 **Right-hand pane** — this session's token breakdown, the rates being applied,
 and a prompt-cache section (hit rate, cached vs fresh, dollars saved). Range
-totals live on the ledger page.
+totals live on the ledger page. Totals are kept per conversation, so reopening a
+conversation after quitting Hermes shows what it has cost so far (conversations
+from before v2.0 start counting from their next reply).
 
 <img src="image/session-pane-en.png" alt="Session pane: claude-opus-5 on github-copilot, $12.45, 15.22M total tokens, 97% cache hit rate, $65.73 saved, rates $5/$25/$0.5 per Mtok" width="340">
 
