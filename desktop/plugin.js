@@ -678,6 +678,8 @@ const $range = atom('today')
 /** Last storage write failure (null when the latest write succeeded). */
 const $storageError = atom(null)
 let storage = null
+/** ctx.os (curated OS door) — absent on older app builds. */
+let osApi = null
 
 function saveLedger(next) {
   $ledger.set(next)
@@ -757,6 +759,11 @@ function enqueueUsage(sessionId, usage) {
 }
 
 async function writeClipboard(text) {
+  try {
+    if (osApi && typeof osApi.writeClipboard === 'function' && (await osApi.writeClipboard(text))) return true
+  } catch {
+    /* fall through */
+  }
   try {
     if (navigator.clipboard && navigator.clipboard.writeText) {
       await navigator.clipboard.writeText(text)
@@ -1343,6 +1350,7 @@ export default {
   description: 'Live token usage and model-aware cost, with a persistent per-day ledger.',
   register(ctx) {
     storage = ctx.storage
+    osApi = ctx.os || null
     const { ledger, migrated } = readStoredLedger(ctx.storage)
     $ledger.set(ledger)
     if (migrated) saveLedger(ledger)
@@ -1350,6 +1358,7 @@ export default {
     ctx.onDispose($range.listen(v => ctx.storage.set('range', v)))
     ctx.onDispose(() => {
       storage = null
+      osApi = null
       chains.clear()
     })
 
